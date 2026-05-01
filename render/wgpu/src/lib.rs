@@ -29,6 +29,11 @@ type Error = Box<dyn std::error::Error>;
 #[macro_use]
 pub mod utils;
 
+// [seer-patch] Runtime gate for seer-specific patches. Off by
+// default; the seer launcher flips it via `seer::set_seer_mode(true)`
+// at startup. Other callers see no change.
+pub mod seer;
+
 mod bitmaps;
 mod context3d;
 mod globals;

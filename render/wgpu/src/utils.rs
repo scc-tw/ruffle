@@ -171,7 +171,20 @@ pub fn buffer_to_image(
 
         // The image copied from the GPU uses premultiplied alpha, so
         // convert to straight alpha if requested by the user.
-        ruffle_render::utils::unmultiply_alpha_rgba(&mut bytes);
+        //
+        // [seer-patch] When a `SeerHost` is installed and asks for
+        // it, we skip this per-pixel CPU pass — at 1280×720 it
+        // costs ~10 ms per readback on the rendered-tick fast path.
+        // Hosts that consume premultiplied data (Slint via
+        // `Image::from_rgba8_premultiplied`, GPU compositors, …)
+        // opt in by overriding `SeerHost::skip_unmultiply_on_capture`.
+        // With no host installed the slot is `None` and we fall
+        // through to the upstream Ruffle path.
+        let skip_unmul = crate::seer::host()
+            .is_some_and(|h| h.skip_unmultiply_on_capture());
+        if !skip_unmul {
+            ruffle_render::utils::unmultiply_alpha_rgba(&mut bytes);
+        }
 
         image::RgbaImage::from_raw(size.width, size.height, bytes)
             .expect("Retrieved texture buffer must be a valid RgbaImage")
