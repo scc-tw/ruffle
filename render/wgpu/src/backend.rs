@@ -406,6 +406,26 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             ),
             1,
         );
+        // [seer-patch] Short-circuit when nothing actually changed.
+        // Upstream Ruffle unconditionally rebuilds: render-target
+        // texture, readback buffer, Surface, TexturePool — all freshly
+        // allocated on the GPU. With a host that fires
+        // `set_viewport_dimensions` per-tick (or whenever Slint's
+        // bound flash-w / flash-h jitter), every rebuild leaks
+        // ~3-4 MB of HOST_VISIBLE GPU memory until the old resources
+        // finish their pending GPU work and drop. On Intel iGPU
+        // (unified memory) those allocations count as process commit
+        // and accumulate quickly. The host already gates on size
+        // changes, but a defensive check here costs nothing and
+        // also covers the Surface/TexturePool no-op path that
+        // upstream skips entirely.
+        if self.target.width() == width
+            && self.target.height() == height
+            && self.viewport_scale_factor == dimensions.scale_factor
+        {
+            return;
+        }
+
         self.target.resize(&self.descriptors.device, width, height);
 
         self.surface = Surface::new(
@@ -668,11 +688,26 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             extent,
         );
 
+        // [seer-patch] Tally GPU bytes for the seer memory monitor
+        // BEFORE wrapping the texture, so the host's
+        // `on_bitmap_registered` runs synchronously with the
+        // RenderBackend::register_bitmap return. We bake the byte
+        // count into the Texture so its Drop handler can balance
+        // the count without needing to recompute (the wgpu::Texture
+        // dimensions/format are available through the texture handle
+        // post-Drop, but only via accessors that may not work for
+        // already-destroyed textures on some backends).
+        let bitmap_bytes = (extent.width as u64) * (extent.height as u64) * 4;
+        if let Some(host) = crate::seer::host() {
+            host.on_bitmap_registered(extent.width, extent.height, bitmap_bytes);
+        }
+
         let handle = BitmapHandle(Arc::new(Texture {
             texture,
             bind_linear: Default::default(),
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
+            bitmap_bytes,
         }));
 
         Ok(handle)
@@ -941,6 +976,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     bind_linear: Default::default(),
                     bind_nearest: Default::default(),
                     copy_count: Cell::new(0),
+                    bitmap_bytes: 0, // [seer-patch] not a bitmap registration
                 }))
             }
         };
@@ -1098,6 +1134,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             bind_linear: Default::default(),
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
+            bitmap_bytes: 0, // [seer-patch] not a bitmap registration
         })))
     }
 

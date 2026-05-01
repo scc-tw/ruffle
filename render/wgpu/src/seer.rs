@@ -63,6 +63,32 @@ pub trait SeerHost: Send + Sync + 'static {
     fn skip_unmultiply_on_capture(&self) -> bool {
         false
     }
+
+    /// Notification that a `BitmapHandle` was registered with the
+    /// renderer (one wgpu Texture allocated, `bytes` bytes of GPU
+    /// memory committed). Fired once per call to
+    /// `RenderBackend::register_bitmap`.
+    ///
+    /// Used by the seer-flash GPU memory monitor to track cumulative
+    /// bitmap residency and emit a warning when bitmap-cache pressure
+    /// approaches the documented leak threshold (Phase-1 launcher hit
+    /// 5 GB of GPU bitmap textures across 200+ live SWFs over a
+    /// 218 s session — see `docs/architecture.md` §5b.4).
+    ///
+    /// Default: no-op (preserve upstream Ruffle behaviour).
+    fn on_bitmap_registered(&self, _width: u32, _height: u32, _bytes: u64) {}
+
+    /// Notification that a `BitmapHandle`'s underlying GPU texture
+    /// is being dropped. Fires from the wgpu backend's `Texture`
+    /// destructor — by that point the wgpu resource has been
+    /// signalled for release but Vulkan may still be holding the
+    /// underlying device memory until the next command-queue flush.
+    ///
+    /// Pair with `on_bitmap_registered` to maintain a running census
+    /// of live GPU bitmap bytes.
+    ///
+    /// Default: no-op.
+    fn on_bitmap_dropped(&self, _bytes: u64) {}
 }
 
 /// A trivial host that returns every upstream default. Useful as a

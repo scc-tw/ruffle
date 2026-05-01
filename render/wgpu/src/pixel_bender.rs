@@ -487,6 +487,7 @@ pub(super) fn run_pixelbender_shader_impl(
                             bind_linear: Default::default(),
                             bind_nearest: Default::default(),
                             copy_count: Cell::new(0),
+                            bitmap_bytes: 0, // [seer-patch] pixel_bender
                         }))
                     });
                     *texture = Some(cached_fresh_handle.clone().into());

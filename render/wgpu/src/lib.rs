@@ -255,6 +255,31 @@ pub struct Texture {
     bind_linear: OnceCell<BitmapBinds>,
     bind_nearest: OnceCell<BitmapBinds>,
     copy_count: Cell<u8>,
+    /// [seer-patch] Cumulative-bytes tally for the seer GPU memory
+    /// monitor. Set by `WgpuRenderBackend::register_bitmap` to
+    /// `width * height * 4`. Used by [`Drop`] below to balance the
+    /// `SeerHost::on_bitmap_registered` census when the underlying
+    /// wgpu texture is released. `0` for textures created outside
+    /// `register_bitmap` (render targets, atlas pages, …) — those
+    /// don't participate in the bitmap-cache pressure tally.
+    pub(crate) bitmap_bytes: u64,
+}
+
+// [seer-patch] Texture Drop balances the cumulative-bytes census kept
+// by `SeerHost::on_bitmap_registered`. Without this, the host
+// monitor's gauge would only ever rise. The hook fires synchronously
+// with the wgpu::Texture's Rust-side drop; the underlying
+// VkDeviceMemory is released asynchronously by wgpu when the GPU
+// finishes any in-flight work, so the host's gauge tracks "in-flight
+// + alive" rather than "currently mapped to GPU memory".
+impl Drop for Texture {
+    fn drop(&mut self) {
+        if self.bitmap_bytes > 0
+            && let Some(host) = crate::seer::host()
+        {
+            host.on_bitmap_dropped(self.bitmap_bytes);
+        }
+    }
 }
 
 impl Texture {

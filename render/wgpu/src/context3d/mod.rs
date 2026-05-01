@@ -115,6 +115,7 @@ impl WgpuContext3D {
                 bind_nearest: Default::default(),
                 texture: dummy_texture,
                 copy_count: Cell::new(0),
+                bitmap_bytes: 0, // [seer-patch] context3d, not a bitmap reg
             }))
         };
 
@@ -648,12 +649,14 @@ impl Context3D for WgpuContext3D {
                         bind_linear: Default::default(),
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        bitmap_bytes: 0, // [seer-patch] context3d
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: front_buffer_resolve_texture.unwrap(),
                         bind_linear: Default::default(),
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        bitmap_bytes: 0, // [seer-patch] context3d
                     }));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
@@ -664,12 +667,14 @@ impl Context3D for WgpuContext3D {
                         bind_linear: Default::default(),
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        bitmap_bytes: 0, // [seer-patch] context3d
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: front_buffer_texture,
                         bind_linear: Default::default(),
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
+                        bitmap_bytes: 0, // [seer-patch] context3d
                     }));
                     self.current_texture_resolve_view = None;
                 }
