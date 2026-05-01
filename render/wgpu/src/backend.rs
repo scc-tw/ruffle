@@ -642,6 +642,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         self.offscreen_texture_pool = TexturePool::new();
     }
 
+    /// [seer-patch] Submit an empty command buffer to the wgpu queue
+    /// so any queued texture / buffer frees from recently-dropped
+    /// `BitmapHandle`s actually return their `VkDeviceMemory` to
+    /// gpu-allocator (and beyond it, to the OS). Invoked by the
+    /// player's post-frame sweep after `MovieLibrary` entries are
+    /// dropped — without this flush, gpu-allocator continues to
+    /// regard the dropped textures' blocks as in-flight until the
+    /// next real `submit_frame`, defeating the eviction.
+    fn empty_submit(&mut self) {
+        // `Queue::submit` with an empty iterator returns a fresh
+        // `SubmissionIndex`. wgpu's internal resource-cleanup pass
+        // runs as part of any submit, so the empty case is
+        // sufficient to drain the pending-free list. We discard
+        // the index because nothing here waits on it.
+        let _ = self.descriptors.queue.submit(std::iter::empty());
+    }
+
     #[instrument(level = "debug", skip_all)]
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
         let mut bitmap = bitmap.to_rgba();

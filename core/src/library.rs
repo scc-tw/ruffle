@@ -17,8 +17,10 @@ use ruffle_render::utils::remove_invalid_jpeg_data;
 use crate::backend::ui::{FontDefinition, UiBackend};
 use crate::font::DefaultFont;
 use fnv::{FnvHashMap, FnvHashSet};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use weak_table::{PtrWeakKeyHashMap, WeakValueHashMap, traits::WeakElement};
 
 #[derive(Clone)]
@@ -115,6 +117,21 @@ impl<'gc> Avm2ClassRegistry<'gc> {
     }
 }
 
+/// [seer-patch] Per-variant character counts produced by
+/// `MovieLibrary::character_counts`. The rest of `Character`
+/// variants (Avm1Button, Avm2Button, Video, BinaryData) fold into
+/// `other`; they're either rare or carry negligible bytes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CharacterCounts {
+    pub bitmap: usize,
+    pub shape: usize,
+    pub sprite: usize,
+    pub font: usize,
+    pub text: usize,
+    pub sound: usize,
+    pub other: usize,
+}
+
 /// Symbol library for a single given SWF.
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -126,6 +143,14 @@ pub struct MovieLibrary<'gc> {
     jpeg_tables: Option<Vec<u8>>,
     fonts: FontMap<'gc>,
     avm2_domain: Option<Avm2Domain<'gc>>,
+    /// [seer-patch] Wall-clock at last character lookup. Bumped from
+    /// every `character_by_*` / `instantiate_*` / `get_*` path so
+    /// `Library::abandonable_movies` can find idle SWFs whose
+    /// `MovieLibrary` is safe to evict (releasing every decoded
+    /// `BitmapHandle` / Font glyph atlas / etc. owned by it).
+    /// `Cell` is fine because gc-arena is single-threaded.
+    #[collect(require_static)]
+    last_touch: Cell<Instant>,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -138,13 +163,107 @@ impl<'gc> MovieLibrary<'gc> {
             jpeg_tables: None,
             fonts: Default::default(),
             avm2_domain: None,
+            last_touch: Cell::new(Instant::now()),
         }
+    }
+
+    /// [seer-patch] Bump the touch clock. Called from every lookup
+    /// path so an active SWF stays "warm" and out of
+    /// `Library::abandonable_movies`'s output.
+    #[inline]
+    fn touch(&self) {
+        self.last_touch.set(Instant::now());
+    }
+
+    /// [seer-patch] When this library was last accessed.
+    pub fn last_touch(&self) -> Instant {
+        self.last_touch.get()
+    }
+
+    /// [seer-patch] The source SWF this library was parsed from.
+    pub fn swf(&self) -> &Arc<SwfMovie> {
+        &self.swf
+    }
+
+    /// [seer-patch] Sum of decoded GPU bytes (width × height × 4)
+    /// across every `BitmapCharacter` in this library whose lazy
+    /// handle has been realised. Bitmaps still in compressed form
+    /// don't contribute (no GPU memory committed yet).
+    pub fn bitmap_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for ch in self.characters.values() {
+            if let Character::Bitmap(bc) = ch
+                && let Some(b) = bc.realised_bytes()
+            {
+                total = total.saturating_add(b);
+            }
+        }
+        total
+    }
+
+    /// [seer-patch] Sum of compressed source bytes
+    /// (`CompressedBitmap::Jpeg.data + alpha`, or
+    /// `Lossless.data`) across every `BitmapCharacter`. Lives on
+    /// CPU heap regardless of whether the GPU handle has been
+    /// realised, so this number is **additive** with
+    /// `bitmap_bytes`, not exclusive: a bitmap currently on GPU
+    /// also still has its compressed source in heap.
+    pub fn compressed_bitmap_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for ch in self.characters.values() {
+            if let Character::Bitmap(bc) = ch {
+                total = total.saturating_add(bc.compressed_source_bytes());
+            }
+        }
+        total
+    }
+
+    /// [seer-patch] Length of the raw SWF source bytes the library
+    /// keeps alive via its `Arc<SwfMovie>`. CPU heap.
+    pub fn swf_data_bytes(&self) -> u64 {
+        self.swf.data().len() as u64
+    }
+
+    /// [seer-patch] Per-variant character counts. Useful for
+    /// triangulating where non-bitmap memory lives (e.g. lots of
+    /// `Graphic`s ⇒ tessellation cache pressure; lots of
+    /// `MovieClip`s ⇒ AVM2 vtable / timeline weight).
+    pub fn character_counts(&self) -> CharacterCounts {
+        let mut c = CharacterCounts::default();
+        for ch in self.characters.values() {
+            match ch {
+                Character::Bitmap(_) => c.bitmap += 1,
+                Character::Graphic(_) | Character::MorphShape(_) => c.shape += 1,
+                Character::MovieClip(_) => c.sprite += 1,
+                Character::Font(_) => c.font += 1,
+                Character::Text(_) | Character::EditText(_) => c.text += 1,
+                Character::Sound(_) => c.sound += 1,
+                _ => c.other += 1,
+            }
+        }
+        c
+    }
+
+    /// [seer-patch] Count of `Character::Sound` entries. A non-zero
+    /// count blocks eviction when
+    /// `AssetArenaPolicy::never_evict_with_audio` is set, since
+    /// dropping the library would release the registered
+    /// `SoundHandle` and could cut mid-playback audio.
+    pub fn sound_count(&self) -> usize {
+        self.characters
+            .values()
+            .filter(|c| matches!(c, Character::Sound(_)))
+            .count()
     }
 
     /// Registers a character; returns `true` if successful, or `false` if a character with
     /// the given ID already exists.
     pub fn register_character(&mut self, id: CharacterId, character: Character<'gc>) -> bool {
         use std::collections::hash_map::Entry;
+        // [seer-patch] Treat registration as a touch — a freshly
+        // parsed library is warm. If the SWF is loaded but never
+        // displayed, the idle clock starts ticking from here.
+        self.touch();
         match self.characters.entry(id) {
             Entry::Vacant(e) => {
                 if let Character::Font(font) = character {
@@ -188,6 +307,7 @@ impl<'gc> MovieLibrary<'gc> {
     }
 
     pub fn character_by_id(&self, id: CharacterId) -> Option<Character<'gc>> {
+        self.touch();
         self.characters.get(&id).copied()
     }
 
@@ -195,6 +315,7 @@ impl<'gc> MovieLibrary<'gc> {
         &self,
         name: AvmString<'gc>,
     ) -> Option<(CharacterId, Character<'gc>)> {
+        self.touch();
         if let Some(id) = self.export_characters.get(name, false)
             && let Some(character) = self.characters.get(id)
         {
@@ -204,6 +325,7 @@ impl<'gc> MovieLibrary<'gc> {
     }
 
     pub fn character_id_by_import_name(&self, name: AvmString<'gc>) -> Option<CharacterId> {
+        self.touch();
         self.imported_assets.get(&name).copied()
     }
 
@@ -218,6 +340,7 @@ impl<'gc> MovieLibrary<'gc> {
         id: CharacterId,
         mc: &Mutation<'gc>,
     ) -> Option<DisplayObject<'gc>> {
+        self.touch();
         if let Some(&character) = self.characters.get(&id) {
             self.instantiate_display_object(id, character, mc)
         } else {
@@ -233,6 +356,7 @@ impl<'gc> MovieLibrary<'gc> {
         export_name: AvmString<'gc>,
         mc: &Mutation<'gc>,
     ) -> Option<DisplayObject<'gc>> {
+        // `character_by_export_name` already touches — no double bump.
         if let Some((id, character)) = self.character_by_export_name(export_name) {
             self.instantiate_display_object(id, character, mc)
         } else {
@@ -276,6 +400,7 @@ impl<'gc> MovieLibrary<'gc> {
     }
 
     pub fn get_font(&self, id: CharacterId) -> Option<Font<'gc>> {
+        self.touch();
         if let Some(&Character::Font(font)) = self.characters.get(&id) {
             Some(font)
         } else {
@@ -284,12 +409,16 @@ impl<'gc> MovieLibrary<'gc> {
     }
 
     pub fn embedded_fonts(&self) -> Vec<Font<'gc>> {
+        // [seer-patch] AS3 `Font.enumerateFonts(false)` lands here.
+        // Treat as a live use so font-heavy libs don't false-idle.
+        self.touch();
         self.fonts.all()
     }
 
     /// Returns the `Graphic` with the given character ID.
     /// Returns `None` if the ID does not exist or is not a `Graphic`.
     pub fn get_graphic(&self, id: CharacterId) -> Option<Graphic<'gc>> {
+        self.touch();
         if let Some(&Character::Graphic(graphic)) = self.characters.get(&id) {
             Some(graphic)
         } else {
@@ -300,6 +429,7 @@ impl<'gc> MovieLibrary<'gc> {
     /// Returns the `MorphShape` with the given character ID.
     /// Returns `None` if the ID does not exist or is not a `MorphShape`.
     pub fn get_morph_shape(&self, id: CharacterId) -> Option<MorphShape<'gc>> {
+        self.touch();
         if let Some(&Character::MorphShape(morph_shape)) = self.characters.get(&id) {
             Some(morph_shape)
         } else {
@@ -308,6 +438,7 @@ impl<'gc> MovieLibrary<'gc> {
     }
 
     pub fn get_sound(&self, id: CharacterId) -> Option<SoundHandle> {
+        self.touch();
         if let Some(Character::Sound(sound)) = self.characters.get(&id) {
             Some(*sound)
         } else {
@@ -318,6 +449,7 @@ impl<'gc> MovieLibrary<'gc> {
     /// Returns the `Text` with the given character ID.
     /// Returns `None` if the ID does not exist or is not a `Text`.
     pub fn get_text(&self, id: CharacterId) -> Option<Text<'gc>> {
+        self.touch();
         if let Some(&Character::Text(text)) = self.characters.get(&id) {
             Some(text)
         } else {
@@ -356,10 +488,20 @@ impl<'gc> MovieLibrary<'gc> {
     /// AVM2 code into a particular domain, even though it turned out to be
     /// an AVM1 movie, and thus this domain is unused.
     pub fn avm2_domain(&self) -> Avm2Domain<'gc> {
+        // [seer-patch] AVM2 hot path: every `loaderInfo.applicationDomain`
+        // access and every class resolution walks through here. Without
+        // this touch, an actively-running AS3 SWF can be falsely judged
+        // idle by `Library::abandonable_movies` while it is still
+        // resolving classes from its own domain.
+        self.touch();
         self.avm2_domain.unwrap()
     }
 
     pub fn try_avm2_domain(&self) -> Option<Avm2Domain<'gc>> {
+        // [seer-patch] Same reasoning as `avm2_domain`. Bump the touch
+        // clock unconditionally — even a `None` return is a probe that
+        // proves the library is still being interrogated.
+        self.touch();
         self.avm2_domain
     }
 }
@@ -420,6 +562,22 @@ impl<'gc> MovieLibraries<'gc> {
 
     fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.0.keys()
+    }
+
+    /// [seer-patch] Iterate `(Arc<SwfMovie>, &MovieLibrary)` pairs.
+    /// `PtrWeakKeyHashMap::iter` upgrades each weak key for us; the
+    /// resulting `Arc` does *not* extend lifetime past upstream's
+    /// existing `Arc<SwfMovie>` strong refs (the library always
+    /// holds one already), so iteration is just bookkeeping.
+    fn iter(&self) -> impl Iterator<Item = (Arc<SwfMovie>, &MovieLibrary<'gc>)> + '_ {
+        self.0.iter()
+    }
+
+    /// [seer-patch] Remove the entry whose key Arc is pointer-equal
+    /// to `key`. Returning the value lets callers inspect / move it
+    /// before drop if they want. Used by `Library::remove_movie`.
+    fn remove(&mut self, key: &Arc<SwfMovie>) -> Option<MovieLibrary<'gc>> {
+        self.0.remove(key)
     }
 }
 
@@ -739,6 +897,125 @@ impl<'gc> Library<'gc> {
     /// Mutate the AVM2 class registry.
     pub fn avm2_class_registry_mut(&mut self) -> &mut Avm2ClassRegistry<'gc> {
         &mut self.avm2_class_registry
+    }
+
+    /// [seer-patch] Snapshot of every `MovieLibrary`'s memory
+    /// footprint. Cheap (walks each library's character HashMap
+    /// once); intended for the periodic
+    /// `CoreSeerHost::on_library_report` callback.
+    pub fn library_entries(&self) -> Vec<crate::seer::LibraryEntry> {
+        let now = Instant::now();
+        let mut out = Vec::with_capacity(self.movie_libraries.0.len());
+        for (swf_arc, lib) in self.movie_libraries.iter() {
+            let url = url_of_swf(&swf_arc);
+            // Subtract:
+            //   1 for the Arc we just upgraded from the WeakKey,
+            //   1 for `MovieLibrary::swf` (always held strong).
+            // What remains *includes both* live DisplayObject
+            // clones and AVM2-internal clones held by Scripts in
+            // `lib.avm2_domain` — this number is diagnostic only
+            // and is **not** the eviction gate (that uses display
+            // tree presence; see `abandonable_movies`).
+            let strong = Arc::strong_count(&swf_arc).saturating_sub(2);
+            let counts = lib.character_counts();
+            out.push(crate::seer::LibraryEntry {
+                url,
+                bitmap_bytes: lib.bitmap_bytes(),
+                compressed_bitmap_bytes: lib.compressed_bitmap_bytes(),
+                swf_data_bytes: lib.swf_data_bytes(),
+                character_count: lib.characters.len(),
+                shape_count: counts.shape,
+                sprite_count: counts.sprite,
+                font_count: counts.font,
+                text_count: counts.text,
+                sound_count: counts.sound,
+                idle_for: now.duration_since(lib.last_touch.get()),
+                external_refs: strong,
+            });
+        }
+        out
+    }
+
+    /// [seer-patch] Identify `MovieLibrary` entries safe to evict.
+    /// "Safe" means three things, all required:
+    ///
+    ///  1. **Not referenced by any live DisplayObject.** Caller
+    ///     supplies `live_movies`, the set of `SwfMovie` pointers
+    ///     reachable from the stage's render tree (see
+    ///     `Player::collect_live_movies`). If our library's movie
+    ///     is in that set, an active MovieClip / Bitmap / etc. is
+    ///     still mounted and a future `place_object` tag could
+    ///     resolve a character ID — eviction would dangle.
+    ///
+    ///     **Note on liveness signal choice.** An earlier version of
+    ///     this check used `Arc::strong_count(&swf) > 2` (assuming
+    ///     "extra refs ⇒ external holder"). That was wrong for AVM2
+    ///     SWFs: `lib.avm2_domain` is a `Gc<DomainData>` whose
+    ///     `defs: PropertyMap<Script>` contains Scripts that each
+    ///     hold an `Arc<SwfMovie>` clone (via `TranslationUnit`).
+    ///     Every AS3 SWF therefore has `strong_count = 2 + N` where
+    ///     N is the number of scripts loaded — strictly > 2 — and
+    ///     no AVM2 SWF was ever evictable. The display-tree set is
+    ///     immune to that internal cycle.
+    ///
+    ///  2. **Idle for at least `idle_threshold`.** Prevents us from
+    ///     evicting between two consecutive uses inside the same
+    ///     frame (e.g. two `Loader.load`s that resolve to the
+    ///     same library).
+    ///
+    ///  3. **No `Sound` characters when `audio_guard`.** Dropping
+    ///     a library with a registered `SoundHandle` could cut
+    ///     mid-playback audio, depending on the audio backend's
+    ///     handle lifecycle.
+    ///
+    /// Returns the SwfMovie key for each evictable library so the
+    /// caller can pass it to `remove_movie` in a separate pass
+    /// (we don't mutate during iteration).
+    pub fn abandonable_movies(
+        &self,
+        live_movies: &FnvHashSet<*const SwfMovie>,
+        idle_threshold: Duration,
+        audio_guard: bool,
+    ) -> Vec<Arc<SwfMovie>> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (swf_arc, lib) in self.movie_libraries.iter() {
+            // Display-tree presence is the authoritative
+            // "in-use" signal — see method doc above.
+            if live_movies.contains(&Arc::as_ptr(&swf_arc)) {
+                continue;
+            }
+            if now.duration_since(lib.last_touch.get()) < idle_threshold {
+                continue;
+            }
+            if audio_guard && lib.sound_count() > 0 {
+                continue;
+            }
+            out.push(swf_arc);
+        }
+        out
+    }
+
+    /// [seer-patch] Remove and drop a `MovieLibrary` entry. Returns
+    /// `true` on hit. Dropping the entry releases every
+    /// `Character<'gc>` it owned; the underlying gc-arena
+    /// allocations become eligible for collection on the next
+    /// sweep, at which point each `BitmapCharacter`'s
+    /// `OnceCell<BitmapHandle>` drops, releasing its
+    /// `wgpu::Texture` (subject to the renderer's queued-free
+    /// flush — see `RenderBackend::empty_submit`).
+    pub fn remove_movie(&mut self, movie: &Arc<SwfMovie>) -> bool {
+        self.movie_libraries.remove(movie).is_some()
+    }
+}
+
+/// [seer-patch] Best-effort URL extraction for memory reports.
+fn url_of_swf(swf: &Arc<SwfMovie>) -> Option<String> {
+    let u = swf.url();
+    if u.is_empty() {
+        None
+    } else {
+        Some(u.to_string())
     }
 }
 

@@ -55,6 +55,13 @@ pub mod config;
 pub mod debug_ui;
 pub mod external;
 pub mod i18n;
+// [seer-patch] Process-global seer-core host slot. Mirrors the
+// `ruffle_render_wgpu::seer` module on the render side. Each
+// patched call site in this crate reads its installed host through
+// `seer::host()` and falls through to upstream Ruffle when the
+// slot is empty, so the crate is byte-identical to upstream when
+// nothing is installed.
+pub mod seer;
 pub mod stub;
 
 pub use context_menu::ContextMenuItem;

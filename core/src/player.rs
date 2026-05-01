@@ -30,7 +30,7 @@ use crate::context_menu::{
 use crate::display_object::Avm2MousePick;
 use crate::display_object::{
     EditText, InteractiveObject, Stage, StageAlign, StageDisplayState, StageScaleMode,
-    TInteractiveObject, WindowMode,
+    TDisplayObject, TDisplayObjectContainer, TInteractiveObject, WindowMode,
 };
 use crate::events::GamepadButton;
 use crate::events::PlayerNotification;
@@ -2088,6 +2088,112 @@ impl Player {
         self.needs_render = false;
     }
 
+    /// [seer-patch] Snapshot every `MovieLibrary`'s memory
+    /// footprint. Cheap O(libraries × characters) walk; intended
+    /// to be called by the host every few seconds for a memory
+    /// log line. Returns an empty vec if no seer host is installed.
+    pub fn library_report(&self) -> Vec<crate::seer::LibraryEntry> {
+        if crate::seer::host().is_none() {
+            return Vec::new();
+        }
+        self.enter_arena(|_, gc_root, _| gc_root.library.library_entries())
+    }
+
+    /// [seer-patch] Layer-2 mimalloc-shape sweep: walk the
+    /// `MovieLibrary` map, drop entries whose source `SwfMovie`
+    /// has no external strong refs and has been idle for at
+    /// least `policy.idle_threshold`, then flush the wgpu free
+    /// queue so released `BitmapHandle`s actually return GPU
+    /// memory to gpu-allocator.
+    ///
+    /// Two-pass internally: pass 1 (shared borrow) collects the
+    /// set of evictable Arcs and tallies their bitmap bytes; pass
+    /// 2 (mutable borrow) parks warm bytes via the host and
+    /// removes each library entry. Splitting the passes is what
+    /// avoids a borrow-checker conflict between `library_for_movie`
+    /// (needs `&Library`) and `remove_movie` (needs `&mut`).
+    ///
+    /// Returns `None` if no seer host or no policy is installed
+    /// (upstream Ruffle behaviour). Otherwise returns the
+    /// `SweepReport` even on a zero-removal sweep so hosts can
+    /// log the heartbeat.
+    pub fn sweep_idle_libraries(&mut self) -> Option<crate::seer::SweepReport> {
+        let host = crate::seer::host()?;
+        let policy = host.asset_arena_policy()?;
+
+        let root_swf = self.swf.clone();
+        let mut report = crate::seer::SweepReport::default();
+
+        self.enter_arena_mut(|_, gc_root, _| {
+            // [seer-patch] Build the "live movie" set by walking the
+            // stage's display tree. This is the eviction gate's only
+            // liveness signal — see `Library::abandonable_movies` for
+            // why `Arc::strong_count` was the wrong choice (AVM2
+            // Scripts inside the lib's own domain hold internal
+            // movie clones that inflated the count).
+            let mut live: fnv::FnvHashSet<*const SwfMovie> = fnv::FnvHashSet::default();
+            collect_live_movies_into(gc_root.stage.into(), &mut live);
+
+            // Pass 1: collect (arc, bitmap_bytes) for evictables,
+            // skipping the root SWF if the policy says so.
+            let candidates = gc_root.library.abandonable_movies(
+                &live,
+                policy.idle_threshold,
+                policy.never_evict_with_audio,
+            );
+
+            let mut targets: Vec<(Arc<SwfMovie>, u64)> = Vec::with_capacity(candidates.len());
+            for arc in candidates {
+                if policy.never_evict_root && Arc::ptr_eq(&arc, &root_swf) {
+                    continue;
+                }
+                let bytes = gc_root
+                    .library
+                    .library_for_movie(arc.clone())
+                    .map(|l| l.bitmap_bytes())
+                    .unwrap_or(0);
+                targets.push((arc, bytes));
+            }
+
+            // Pass 2: park + remove. We park before removing so
+            // `arc.data()` is still valid (the SwfMovie's strong
+            // count is at least 1 from our targets Vec).
+            for (arc, bytes) in &targets {
+                let url = arc.url();
+                if !url.is_empty() {
+                    host.park_warm_bytes(url, arc.data());
+                }
+                if gc_root.library.remove_movie(arc) {
+                    report.removed += 1;
+                    report.freed_bitmap_bytes =
+                        report.freed_bitmap_bytes.saturating_add(*bytes);
+                }
+            }
+        });
+
+        // Phase B: progress wgpu's GPU timeline. Done *after*
+        // exiting the arena so we have unique &mut access to
+        // self.renderer.
+        //
+        // Note on timing: `remove_movie` only drops the Rust
+        // HashMap entry. The `Character::Bitmap(Gc<...>)` values
+        // it contained are gc-arena allocations whose `Drop`
+        // (and therefore the `Arc<Texture>` decrement on
+        // `BitmapHandle`) does not run until the next gc-arena
+        // collect cycle. Until that happens the textures aren't
+        // even *queued* for free, so this `empty_submit` is a
+        // no-op for the just-removed lib's bitmaps. It's kept
+        // because (a) it advances the GPU timeline cheaply, and
+        // (b) on the *next* sweep the previous sweep's frees
+        // (now collected) get queue-flushed promptly. The first
+        // submit's effective work happens one sweep later.
+        if report.removed > 0 {
+            self.renderer.empty_submit();
+        }
+
+        Some(report)
+    }
+
     /// The current frame of the main timeline, if available.
     /// The first frame is frame 1.
     pub fn current_frame(&self) -> Option<u16> {
@@ -3173,6 +3279,27 @@ pub struct DragObject<'gc> {
     /// The bounding rectangle where the clip will be maintained.
     #[collect(require_static)]
     pub constraint: Rectangle<Twips>,
+}
+
+/// [seer-patch] Recursively walk the display tree and insert each
+/// reachable `SwfMovie` pointer into `out`. Used by
+/// `Player::sweep_idle_libraries` to build the live-movie gate for
+/// `Library::abandonable_movies`.
+///
+/// We compare by `Arc::as_ptr` rather than cloning the Arc — pointer
+/// equality is enough to match against the WeakKey upgrade in
+/// `MovieLibraries::iter`, and avoids bumping the very strong count
+/// we'd otherwise be using as a liveness signal.
+fn collect_live_movies_into<'gc>(
+    node: crate::display_object::DisplayObject<'gc>,
+    out: &mut fnv::FnvHashSet<*const SwfMovie>,
+) {
+    out.insert(Arc::as_ptr(&node.movie()));
+    if let Some(container) = node.as_container() {
+        for child in container.iter_render_list() {
+            collect_live_movies_into(child, out);
+        }
+    }
 }
 
 fn run_mouse_pick<'gc>(

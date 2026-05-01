@@ -77,6 +77,23 @@ pub trait RenderBackend: Any {
         cache_entries: Vec<BitmapCacheEntry>,
     );
 
+    /// [seer-patch] Flush any backend-side queued resource frees.
+    ///
+    /// `Player::post_frame_sweep` (in our fork) drops a batch of
+    /// `MovieLibrary` entries → their `Character<'gc>`s become
+    /// gc-eligible → on the next gc-arena sweep, each
+    /// `BitmapCharacter`'s `OnceCell<BitmapHandle>` drops →
+    /// the wgpu `Texture`'s Drop fires, but wgpu has only *queued*
+    /// the underlying `VkImage` for release. Until the next
+    /// command-queue submit, gpu-allocator continues to consider
+    /// those blocks live. Calling this after a sweep flushes the
+    /// queue (e.g. `wgpu::Queue::submit(empty)`) so freed memory
+    /// returns to the pool / OS promptly.
+    ///
+    /// Default: no-op (preserves upstream behaviour for non-wgpu
+    /// backends and any backend that doesn't queue frees).
+    fn empty_submit(&mut self) {}
+
     fn create_empty_texture(
         &mut self,
         width: NonZeroU32,

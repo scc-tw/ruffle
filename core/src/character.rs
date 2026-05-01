@@ -79,6 +79,29 @@ impl<'gc> BitmapCharacter<'gc> {
         self.handle.set(new_handle.clone()).unwrap();
         Ok(new_handle)
     }
+
+    /// [seer-patch] GPU residency in bytes if the lazy `BitmapHandle`
+    /// has been realised, otherwise `None`. Used by
+    /// `MovieLibrary::bitmap_bytes` to attribute decoded GPU memory
+    /// per source SWF without having to walk the renderer's pools.
+    /// Lazy (still compressed) bitmaps don't contribute — they live
+    /// in heap and are accounted there.
+    pub fn realised_bytes(&self) -> Option<u64> {
+        if self.handle.get().is_some() {
+            let s = self.compressed.size();
+            Some(u64::from(s.width) * u64::from(s.height) * 4)
+        } else {
+            None
+        }
+    }
+
+    /// [seer-patch] Source bytes still held in `CompressedBitmap`
+    /// regardless of whether the lazy handle has been realised.
+    /// Used by `MovieLibrary::compressed_bitmap_bytes` to attribute
+    /// the heap-side cost of un-decoded image source per SWF.
+    pub fn compressed_source_bytes(&self) -> u64 {
+        self.compressed.source_bytes()
+    }
 }
 
 /// Holds a bitmap from an SWF tag, plus the decoded width/height.
@@ -97,6 +120,20 @@ pub enum CompressedBitmap {
 }
 
 impl CompressedBitmap {
+    /// [seer-patch] Bytes of source (compressed) image data still
+    /// held in heap. For JPEGs this includes the alpha plane.
+    /// For lossless tags this is the parsed `data` slice from the
+    /// `DefineBitsLossless` tag.
+    pub fn source_bytes(&self) -> u64 {
+        match self {
+            CompressedBitmap::Jpeg { data, alpha, .. } => {
+                let alpha_len = alpha.as_ref().map(|a| a.len()).unwrap_or(0);
+                (data.len() + alpha_len) as u64
+            }
+            CompressedBitmap::Lossless(define) => define.data.len() as u64,
+        }
+    }
+
     pub fn size(&self) -> BitmapSize {
         match self {
             CompressedBitmap::Jpeg { width, height, .. } => BitmapSize {
