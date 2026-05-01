@@ -108,11 +108,28 @@ macro_rules! make_error {
 
 #[inline(never)]
 #[cold]
+#[track_caller]
 pub fn make_null_or_undefined_error<'gc>(
     activation: &mut Activation<'_, 'gc>,
     value: Value<'gc>,
     name: Option<&Multiname<'gc>>,
 ) -> Error<'gc> {
+    // [seer-patch] Always log the field name (when known) and the
+    // Rust call site (file:line) so we can localize the upstream
+    // code path that fires Error #1009/#1010 — even when the caller
+    // passes `name: None`. Helps find the cmd_46046 NPE source.
+    let field_str = name
+        .map(|m| m.to_qualified_name(activation.gc()).to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let is_undefined = matches!(value, Value::Undefined);
+    let caller = std::panic::Location::caller();
+    tracing::warn!(
+        target: "seer_npe",
+        field = %field_str,
+        is_undefined,
+        caller = %format!("{}:{}", caller.file(), caller.line()),
+        "null/undefined property access (Error #1009/#1010)",
+    );
     if matches!(value, Value::Undefined) {
         make_error_1010(activation, name)
     } else {

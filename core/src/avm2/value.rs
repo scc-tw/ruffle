@@ -920,7 +920,11 @@ impl<'gc> Value<'gc> {
         })
     }
 
+    // [seer-patch] #[track_caller] so make_null_or_undefined_error's
+    // Location::caller() bubbles up past this thin wrapper to the
+    // actual op_* handler that triggered the null check.
     #[inline(always)]
+    #[track_caller]
     pub fn null_check(
         &self,
         activation: &mut Activation<'_, 'gc>,

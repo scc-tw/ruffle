@@ -2540,6 +2540,36 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         if value.is_of_type(class) {
             self.push_stack(value);
         } else {
+            // [seer-patch] Log every `as ByteArray` cast that returns
+            // null — diagnoses the cmd_46046 chain where
+            // TaomeeLibraryDLL's SocketEvent.data fails this cast,
+            // tripping a null deref in BitBuffSetManager.getMultiValue's
+            // callback. Logs source kind (null / undefined / object's
+            // class) so we can tell whether the bug is "data is null"
+            // or "data is wrong type".
+            let target_qname = class.name().to_qualified_name(self.gc());
+            let target_name = target_qname.to_utf8_lossy();
+            if target_name == "flash.utils::ByteArray" {
+                let actual = match value {
+                    Value::Undefined => "undefined".to_string(),
+                    Value::Null => "null".to_string(),
+                    Value::Bool(_) => "Boolean".to_string(),
+                    Value::Number(_) => "Number".to_string(),
+                    Value::Integer(_) => "int".to_string(),
+                    Value::String(_) => "String".to_string(),
+                    Value::Object(o) => o
+                        .instance_class()
+                        .name()
+                        .to_qualified_name(self.gc())
+                        .to_utf8_lossy()
+                        .to_string(),
+                };
+                tracing::warn!(
+                    target: "seer_astype_bytearray",
+                    actual_type = %actual,
+                    "as ByteArray returned null",
+                );
+            }
             self.push_stack(Value::Null);
         }
 
