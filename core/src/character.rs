@@ -38,10 +38,10 @@ pub enum Character<'gc> {
 /// to allow `Player::sweep_idle_bitmaps` to drop the GPU handle
 /// while keeping `compressed` alive on CPU heap for cheap re-decode.
 ///
-/// `last_sampled` is bumped from every `bitmap_handle()` call (which
-/// is the access path for shape-pattern fills referencing this
-/// character). The sweep evicts handles whose `last_sampled` is older
-/// than `BitmapResidencyPolicy::idle_threshold`.
+/// `last_sampled` is bumped from every `bitmap_handle()` call that
+/// returns a real handle (cached or freshly uploaded). The sweep
+/// evicts handles whose `last_sampled` is older than
+/// `BitmapResidencyPolicy::idle_threshold`.
 ///
 /// [seer-patch P1 Day 3] `pending_decode_id` tracks an in-flight
 /// background JPEG/lossless decode. `Some(id)` means the worker is
@@ -49,11 +49,21 @@ pub enum Character<'gc> {
 /// transparent placeholder until the decode completes (kept
 /// per-character to dedup duplicate submits — second call sees the
 /// id and just polls).
+///
+/// `was_realised` is sticky-true once the bitmap has been
+/// successfully uploaded to GPU at least once. Gates the async path:
+/// a brand-new character must decode synchronously inline (otherwise
+/// the placeholder shows as a hole on the very first paint, since
+/// there's no prior frame to fall back on). After the first
+/// successful realisation, subsequent re-realisations after eviction
+/// can use async — the user-visible state has already been correct
+/// once, so a one-frame placeholder while async re-uploads is fine.
 #[derive(Default, Debug)]
 pub struct BitmapResidency {
     pub handle: Option<BitmapHandle>,
     pub last_sampled: Option<Instant>,
     pub pending_decode_id: Option<u64>,
+    pub was_realised: bool,
 }
 
 #[derive(Collect, Debug)]
@@ -117,22 +127,34 @@ impl<'gc> BitmapCharacter<'gc> {
         &self,
         backend: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, RenderError> {
-        // [seer-patch P1] Bump touch + return cached handle if present.
+        // [seer-patch P1] Cache hit fast path. Bump `last_sampled`
+        // here so the residency sweep sees a recent timestamp.
+        // `last_sampled` is intentionally NOT bumped on placeholder
+        // returns: a placeholder render isn't a "real" sample of
+        // this character's pixels.
+        //
         // Drop borrow before any decode/register call so reentrant
-        // `bitmap_handle()` (e.g., from inside a backend hook) doesn't
-        // double-borrow.
-        let pending = {
+        // `bitmap_handle()` (e.g., from inside a backend hook)
+        // doesn't double-borrow.
+        let (pending, was_realised) = {
             let mut r = self.residency.borrow_mut();
-            r.last_sampled = Some(Instant::now());
-            if let Some(handle) = &r.handle {
-                return Ok(handle.clone());
+            if let Some(handle) = r.handle.clone() {
+                r.last_sampled = Some(Instant::now());
+                return Ok(handle);
             }
-            r.pending_decode_id
+            (r.pending_decode_id, r.was_realised)
         };
 
         // [seer-patch P1 Day 3] Async decode handling.
         //
-        //   Strategy `Async`:
+        //   Async path is gated on `was_realised`: brand-new
+        //   characters must decode synchronously inline so first
+        //   paint is correct (otherwise the transparent placeholder
+        //   shows as a hole — see 2026-05-04 background-bitmap
+        //   regression). Async only fires for RE-realisation after
+        //   the residency sweep dropped a previously-uploaded handle.
+        //
+        //   Strategy `Async` + already-realised-once:
         //     - If a decode is in flight (`pending`), poll the host.
         //       On hit, upload + cache + return real handle.
         //       On miss (still in flight), return host's transparent
@@ -140,8 +162,9 @@ impl<'gc> BitmapCharacter<'gc> {
         //     - If no decode in flight, submit one and return the
         //       placeholder for the missed frame.
         //
-        //   Strategy `Sync` (or no host / no policy):
-        //     - Decode inline on the render thread (~10–100 ms hit).
+        //   Strategy `Sync`, never realised, or no host:
+        //     - Decode inline on the render thread (~10–100 ms hit
+        //       on first realisation; same cost as upstream Ruffle).
         //
         // `host` lookup is one OnceLock load; cheap.
         let strategy = crate::seer::host()
@@ -149,7 +172,10 @@ impl<'gc> BitmapCharacter<'gc> {
             .map(|p| p.decode_strategy)
             .unwrap_or(crate::seer::BitmapDecodeStrategy::Sync);
 
-        if matches!(strategy, crate::seer::BitmapDecodeStrategy::Async) {
+        let async_eligible = was_realised
+            && matches!(strategy, crate::seer::BitmapDecodeStrategy::Async);
+
+        if async_eligible {
             let host = crate::seer::host();
             // Poll the in-flight decode if any.
             if let Some(id) = pending
@@ -160,6 +186,8 @@ impl<'gc> BitmapCharacter<'gc> {
                 let new_handle = backend.register_bitmap(decoded)?;
                 let mut r = self.residency.borrow_mut();
                 r.pending_decode_id = None;
+                r.last_sampled = Some(Instant::now());
+                r.was_realised = true;
                 if let Some(existing) = &r.handle {
                     return Ok(existing.clone());
                 }
@@ -176,8 +204,7 @@ impl<'gc> BitmapCharacter<'gc> {
                 }
             }
             // Placeholder for this frame. If host doesn't supply one,
-            // fall through to sync decode (one-time cost; better than
-            // erroring out).
+            // fall through to sync decode below.
             if let Some(host) = host
                 && let Some(ph) = host.placeholder_bitmap(backend)
             {
@@ -186,8 +213,10 @@ impl<'gc> BitmapCharacter<'gc> {
         }
 
         // Sync path: inline decode + register. Used for
-        // `BitmapDecodeStrategy::Sync`, when no host is installed,
-        // or when async path can't supply a placeholder.
+        // - `BitmapDecodeStrategy::Sync`,
+        // - first realisation (was_realised == false),
+        // - no host installed,
+        // - host couldn't supply a placeholder.
         let decoded = self.compressed.decode()?;
         let new_handle = backend.register_bitmap(decoded)?;
         // Re-borrow on store. If a concurrent reentrant call raced
@@ -196,6 +225,8 @@ impl<'gc> BitmapCharacter<'gc> {
         // already-stored handle and let our fresh upload drop.
         {
             let mut r = self.residency.borrow_mut();
+            r.last_sampled = Some(Instant::now());
+            r.was_realised = true;
             if let Some(existing) = &r.handle {
                 return Ok(existing.clone());
             }
