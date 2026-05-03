@@ -2170,8 +2170,10 @@ impl Player {
             // count is at least 1 from our targets Vec).
             for (arc, bytes) in &targets {
                 let url = arc.url();
-                if !url.is_empty() {
-                    host.park_warm_bytes(url, arc.data());
+                if !url.is_empty()
+                    && let Some(parked) = reassemble_uncompressed_swf(arc.as_ref())
+                {
+                    host.park_warm_bytes(url, &parked);
                 }
                 if gc_root.library.remove_movie(arc) {
                     report.removed += 1;
@@ -3476,6 +3478,45 @@ fn sweep_bitmap_data_in_tree<'gc>(
             sweep_bitmap_data_in_tree(mc, child, now, policy, report);
         }
     }
+}
+
+/// [seer-patch] Reconstruct a complete uncompressed (FWS) SWF from a
+/// `SwfMovie`. `SwfMovie::data()` is the post-decompression tag stream
+/// only — no SWF header magic, no `RECT`/framerate/framecount preamble.
+/// Parking those raw tags into the warm cache makes the next
+/// `Loader.load(url)` fail content sniffing (`ContentType::Unknown` →
+/// `Error #2124`), which in turn makes AS3 see an `ioError` event.
+///
+/// We follow the same pattern as `LoaderInfo.bytes`: write a header
+/// with `compression = None` + an empty tag list, trim the implicit
+/// `End` tag, append the real tag bytes, then patch the file-length
+/// field at offset 4. Returns `None` if header serialization fails.
+fn reassemble_uncompressed_swf(movie: &SwfMovie) -> Option<Vec<u8>> {
+    let mut header = movie.header().swf_header().clone();
+    header.compression = swf::Compression::None;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(movie.data().len() + 64);
+    swf::write::write_swf(&header, &[], &mut buf).ok()?;
+
+    // `write_swf` always emits an implicit `End` tag (2 bytes); strip it
+    // before appending the real tag stream.
+    if buf.len() < 2 {
+        return None;
+    }
+    buf.truncate(buf.len() - 2);
+
+    let header_len = buf.len();
+    buf.extend_from_slice(movie.data());
+
+    // Patch the file-length at offset 4 (4 bytes, little-endian) so the
+    // SWF parser doesn't trip over the size mismatch on read-back.
+    let total = (header_len + movie.data().len()) as u32;
+    if buf.len() < 8 {
+        return None;
+    }
+    buf[4..8].copy_from_slice(&total.to_le_bytes());
+
+    Some(buf)
 }
 
 fn run_mouse_pick<'gc>(
