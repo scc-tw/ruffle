@@ -717,7 +717,28 @@ impl<'gc> MovieClip<'gc> {
         let do_abc = reader.read_do_abc_2()?;
         if !do_abc.data.is_empty() {
             let movie = self.movie();
-            let domain = context.library.library_for_movie_mut(movie).avm2_domain();
+            // [seer-patch] `library.avm2_domain()` panics on `unwrap()` if
+            // the entry exists with no domain set yet. We've seen this
+            // fire on PetFightDLL_201308 right after `Loader.load`
+            // completes: `loader.rs::movie_loader_data` calls
+            // `set_avm2_domain` on the new movie's library, but if that
+            // library entry was reaped (e.g., evicted by the asset arena
+            // sweep) and re-created lazily via `library_for_movie_mut`
+            // here, the recreated entry has `avm2_domain == None`.
+            // Bail with a clear log instead of crashing — the SWF will
+            // be missing its ABC scripts, which is bad, but every other
+            // SWF in the player keeps running.
+            let Some(domain) = context
+                .library
+                .library_for_movie_mut(movie.clone())
+                .try_avm2_domain()
+            else {
+                tracing::error!(
+                    movie = %movie.url(),
+                    "do_abc_2: avm2 domain missing for movie library; skipping DoAbc2 tag"
+                );
+                return Ok(None);
+            };
             let name = AvmString::new(context.gc(), do_abc.name.decode(reader.encoding()));
 
             match Avm2::do_abc(
@@ -4249,7 +4270,16 @@ impl<'gc, 'a> MovieClip<'gc> {
                 .context
                 .library
                 .library_for_movie_mut(movie.clone());
-            let domain = library.avm2_domain();
+            // [seer-patch] Same guard as `do_abc_2` — if the library was
+            // reaped + re-created without `set_avm2_domain` running, skip
+            // SymbolClass binding instead of panicking.
+            let Some(domain) = library.try_avm2_domain() else {
+                tracing::error!(
+                    movie = %movie.url(),
+                    "run_abc_and_symbol_tags: avm2 domain missing; skipping SymbolClass batch"
+                );
+                return Ok(());
+            };
 
             for (class_name, id) in eager_tags.symbolclass_names {
                 let name = AvmString::new(activation.gc(), class_name);
