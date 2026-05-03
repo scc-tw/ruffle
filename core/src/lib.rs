@@ -18,7 +18,12 @@ mod avm2;
 mod avm_rng;
 mod binary_data;
 pub mod bitmap;
-mod character;
+// [seer-patch P1 Day 3] Made `pub` so seer-flash's decode_worker
+// can name `CompressedBitmap` in its public API. The character
+// module exposes only the variants relevant to the decode-worker
+// boundary; other internal types (BitmapCharacter, BitmapResidency)
+// remain accessible via the same `pub mod` access.
+pub mod character;
 pub mod context;
 pub mod context_menu;
 mod drawing;

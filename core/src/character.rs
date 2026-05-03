@@ -42,10 +42,18 @@ pub enum Character<'gc> {
 /// is the access path for shape-pattern fills referencing this
 /// character). The sweep evicts handles whose `last_sampled` is older
 /// than `BitmapResidencyPolicy::idle_threshold`.
+///
+/// [seer-patch P1 Day 3] `pending_decode_id` tracks an in-flight
+/// background JPEG/lossless decode. `Some(id)` means the worker is
+/// chewing on `compressed`; `bitmap_handle()` returns the host's
+/// transparent placeholder until the decode completes (kept
+/// per-character to dedup duplicate submits — second call sees the
+/// id and just polls).
 #[derive(Default, Debug)]
 pub struct BitmapResidency {
     pub handle: Option<BitmapHandle>,
     pub last_sampled: Option<Instant>,
+    pub pending_decode_id: Option<u64>,
 }
 
 #[derive(Collect, Debug)]
@@ -113,13 +121,73 @@ impl<'gc> BitmapCharacter<'gc> {
         // Drop borrow before any decode/register call so reentrant
         // `bitmap_handle()` (e.g., from inside a backend hook) doesn't
         // double-borrow.
-        {
+        let pending = {
             let mut r = self.residency.borrow_mut();
             r.last_sampled = Some(Instant::now());
             if let Some(handle) = &r.handle {
                 return Ok(handle.clone());
             }
+            r.pending_decode_id
+        };
+
+        // [seer-patch P1 Day 3] Async decode handling.
+        //
+        //   Strategy `Async`:
+        //     - If a decode is in flight (`pending`), poll the host.
+        //       On hit, upload + cache + return real handle.
+        //       On miss (still in flight), return host's transparent
+        //       placeholder so render path doesn't stall.
+        //     - If no decode in flight, submit one and return the
+        //       placeholder for the missed frame.
+        //
+        //   Strategy `Sync` (or no host / no policy):
+        //     - Decode inline on the render thread (~10–100 ms hit).
+        //
+        // `host` lookup is one OnceLock load; cheap.
+        let strategy = crate::seer::host()
+            .and_then(|h| h.bitmap_residency_policy())
+            .map(|p| p.decode_strategy)
+            .unwrap_or(crate::seer::BitmapDecodeStrategy::Sync);
+
+        if matches!(strategy, crate::seer::BitmapDecodeStrategy::Async) {
+            let host = crate::seer::host();
+            // Poll the in-flight decode if any.
+            if let Some(id) = pending
+                && let Some(host) = host
+                && let Some(decoded) = host.try_take_decoded_bitmap(id)
+            {
+                // Decode completed — upload and cache.
+                let new_handle = backend.register_bitmap(decoded)?;
+                let mut r = self.residency.borrow_mut();
+                r.pending_decode_id = None;
+                if let Some(existing) = &r.handle {
+                    return Ok(existing.clone());
+                }
+                r.handle = Some(new_handle.clone());
+                return Ok(new_handle);
+            }
+            // No completed decode. Submit one if not already in
+            // flight, then return the placeholder.
+            if pending.is_none() {
+                if let Some(host) = host
+                    && let Some(id) = host.submit_async_decode(self.compressed.clone())
+                {
+                    self.residency.borrow_mut().pending_decode_id = Some(id);
+                }
+            }
+            // Placeholder for this frame. If host doesn't supply one,
+            // fall through to sync decode (one-time cost; better than
+            // erroring out).
+            if let Some(host) = host
+                && let Some(ph) = host.placeholder_bitmap(backend)
+            {
+                return Ok(ph);
+            }
         }
+
+        // Sync path: inline decode + register. Used for
+        // `BitmapDecodeStrategy::Sync`, when no host is installed,
+        // or when async path can't supply a placeholder.
         let decoded = self.compressed.decode()?;
         let new_handle = backend.register_bitmap(decoded)?;
         // Re-borrow on store. If a concurrent reentrant call raced
@@ -132,6 +200,8 @@ impl<'gc> BitmapCharacter<'gc> {
                 return Ok(existing.clone());
             }
             r.handle = Some(new_handle.clone());
+            // Clear any stale pending id — our sync upload wins.
+            r.pending_decode_id = None;
         }
         Ok(new_handle)
     }

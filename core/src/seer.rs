@@ -295,6 +295,53 @@ pub trait CoreSeerHost: Send + Sync + 'static {
     fn bitmap_residency_policy(&self) -> Option<BitmapResidencyPolicy> {
         None
     }
+
+    /// [seer-patch P1 Day 3] Submit a `CompressedBitmap` for
+    /// background decode. Returns an opaque request id the caller
+    /// pairs with the originating `BitmapCharacter`. Future render
+    /// frames poll via [`try_take_decoded_bitmap`] until the
+    /// decode completes.
+    ///
+    /// Returns `None` to signal "async path unavailable; caller
+    /// should fall back to inline sync decode". Hosts that don't
+    /// implement async decode get the upstream behaviour.
+    fn submit_async_decode(
+        &self,
+        _compressed: crate::character::CompressedBitmap,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// [seer-patch P1 Day 3] Claim the result of a previously
+    /// submitted async decode. Returns `None` if the decode is
+    /// still in flight (or, rarely, failed — host logs failures and
+    /// drops the entry; the caller's character keeps returning the
+    /// placeholder until eviction-and-resample triggers a fresh
+    /// sync attempt). Returns `Some(_)` on completed decode.
+    ///
+    /// Consumes the mailbox entry — duplicate calls return `None`.
+    fn try_take_decoded_bitmap(
+        &self,
+        _id: u64,
+    ) -> Option<ruffle_render::bitmap::Bitmap<'static>> {
+        None
+    }
+
+    /// [seer-patch P1 Day 3] Lazy 1×1 transparent placeholder
+    /// `BitmapHandle`. Returned from `BitmapCharacter::bitmap_handle`
+    /// while an async decode is in flight, so the render path has
+    /// something to sample from for the missed frame(s) instead of
+    /// stalling on JPEG decode.
+    ///
+    /// Should be cheap to call (host caches a single shared handle
+    /// after first registration). Returns `None` if the host doesn't
+    /// implement the placeholder; caller falls back to sync decode.
+    fn placeholder_bitmap(
+        &self,
+        _backend: &mut dyn ruffle_render::backend::RenderBackend,
+    ) -> Option<ruffle_render::bitmap::BitmapHandle> {
+        None
+    }
 }
 
 /// A trivial host that returns every upstream default. Useful as a
