@@ -23,25 +23,37 @@ pub fn byte_array_allocator<'gc>(
         .avm2_class_registry()
         .class_symbol(class.inner_class_definition())
     {
-        if let Some(lib) = activation.context.library.library_for_movie(movie) {
-            if let Some(Character::BinaryData(binary_data)) = lib.character_by_id(id) {
-                Some(ByteArrayStorage::from_vec(
-                    activation.context,
-                    binary_data.to_vec(),
-                ))
-            } else {
-                None
+        // Pull the bytes out before we drop the immutable library borrow so we
+        // can also report a helpful diagnostic on miss.
+        let lookup = activation
+            .context
+            .library
+            .library_for_movie(movie.clone())
+            .map(|lib| (lib.character_by_id(id).is_some(), match lib.character_by_id(id) {
+                Some(Character::BinaryData(binary_data)) => Some(binary_data.to_vec()),
+                _ => None,
+            }));
+        match lookup {
+            Some((_, Some(b))) => ByteArrayStorage::from_vec(activation.context, b),
+            other => {
+                let kind = match other {
+                    None => "no library_for_movie",
+                    Some((false, _)) => "character id not registered",
+                    Some((true, _)) => "character is not BinaryData",
+                };
+                tracing::warn!(
+                    class = ?class.inner_class_definition().name(),
+                    movie = movie.url(),
+                    id = id,
+                    kind = kind,
+                    "ByteArray-subclass symbol could not resolve to BinaryData; using empty storage"
+                );
+                ByteArrayStorage::new(activation.context)
             }
-        } else {
-            None
         }
     } else {
-        Some(ByteArrayStorage::new(activation.context))
+        ByteArrayStorage::new(activation.context)
     };
-
-    let storage = storage.unwrap_or_else(|| {
-        unreachable!("A ByteArray subclass should have ByteArray in superclass chain")
-    });
 
     let base = ScriptObjectData::new(class);
 
