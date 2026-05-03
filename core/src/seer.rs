@@ -76,6 +76,94 @@ impl Default for AssetArenaPolicy {
     }
 }
 
+/// [seer-patch P1] Strategy for re-decoding an evicted bitmap on its
+/// next sample.
+///
+/// `Sync` decodes inline on the render thread (simplest, but causes a
+/// frame stutter — typically 10–100 ms for big JPEGs).
+///
+/// `Async` posts the decode to a background worker and renders a
+/// transparent placeholder for the in-flight frame. The render thread
+/// re-checks the slot on the next render and picks up the completed
+/// upload. Recommended default.
+#[derive(Debug, Clone, Copy)]
+pub enum BitmapDecodeStrategy {
+    /// Inline decode on the render thread.
+    Sync,
+    /// Background decode + transparent placeholder for the missed frame(s).
+    Async,
+}
+
+impl Default for BitmapDecodeStrategy {
+    fn default() -> Self {
+        Self::Async
+    }
+}
+
+/// [seer-patch P1] Tunables for the per-bitmap GPU-residency sweep
+/// (`Player::sweep_idle_bitmaps`). When `Some(...)` is returned from
+/// [`CoreSeerHost::bitmap_residency_policy`], the host opts into
+/// dropping idle `BitmapHandle`s while keeping the source
+/// `CompressedBitmap` (or `BitmapData::pixels`) alive for cheap
+/// re-realisation.
+///
+/// `None` (the default) preserves upstream Ruffle behaviour: bitmap
+/// GPU handles live for the lifetime of their `BitmapCharacter` /
+/// `BitmapData` and are only freed by lib-level eviction or
+/// gc-arena collection.
+#[derive(Debug, Clone)]
+pub struct BitmapResidencyPolicy {
+    /// Drop a bitmap's GPU handle if it has not been sampled (via
+    /// `bitmap_handle()` / `try_bitmap_handle()`) for at least this
+    /// long. Recommended: 5–15 seconds for tutorial-fight workload.
+    pub idle_threshold: Duration,
+
+    /// How to handle the next sample after eviction. See
+    /// [`BitmapDecodeStrategy`].
+    pub decode_strategy: BitmapDecodeStrategy,
+    // TODO(seer-patch P1): replace `idle_threshold` with a
+    // congestion-aware controller (TCP-style AIMD on bitmap-bytes
+    // headroom vs. budget). Track re-decode rate as the "loss"
+    // signal — high rate ⇒ threshold too short, back off; low
+    // rate ⇒ threshold can shrink toward target budget. Q3 in
+    // docs/plans/bitmap-memory.md.
+}
+
+impl Default for BitmapResidencyPolicy {
+    fn default() -> Self {
+        Self {
+            idle_threshold: Duration::from_secs(10),
+            decode_strategy: BitmapDecodeStrategy::default(),
+        }
+    }
+}
+
+/// [seer-patch P1] Stats returned by `Player::sweep_idle_bitmaps`.
+/// Hosts use these to format a `[bitmap-sweep]` log line and feed
+/// the memory-pressure overlay.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BitmapSweepReport {
+    /// Number of `BitmapCharacter` GPU handles dropped this sweep.
+    pub evicted_chars: usize,
+    /// Number of `BitmapData` GPU handles dropped this sweep.
+    pub evicted_data: usize,
+    /// Estimated GPU bytes freed across `BitmapCharacter` evictions
+    /// (sum of `width × height × 4`). Actual reclamation lags by
+    /// one wgpu submit + one gc-arena cycle, same caveat as
+    /// `SweepReport`.
+    pub freed_char_bytes: u64,
+    /// Estimated GPU bytes freed across `BitmapData` evictions.
+    pub freed_data_bytes: u64,
+    /// Number of realised handles inspected this sweep that were
+    /// kept (recently sampled within the idle threshold).
+    pub kept_realised: usize,
+    /// Total realised handles inspected this sweep (across both
+    /// `BitmapCharacter` and `BitmapData`). Equals
+    /// `kept_realised + evicted_chars + evicted_data` modulo any
+    /// dirty-state skips.
+    pub total_realised: usize,
+}
+
 /// One snapshot of a `MovieLibrary`'s memory footprint. Returned
 /// by `Player::library_report` so the host can render a memory-
 /// pressure overlay or log line.
@@ -181,6 +269,16 @@ pub trait CoreSeerHost: Send + Sync + 'static {
     /// looking up `url` in their warm cache and returning a
     /// clone of the byte buffer on hit.
     fn take_warm_bytes(&self, _url: &str) -> Option<Arc<[u8]>> {
+        None
+    }
+
+    /// [seer-patch P1] If `Some`, enables `Player::sweep_idle_bitmaps`
+    /// to drop idle GPU `BitmapHandle`s while keeping their source
+    /// `CompressedBitmap` / `BitmapData::pixels` alive for cheap
+    /// re-realisation on next sample.
+    ///
+    /// Default: `None` (no sweep, identical to upstream Ruffle).
+    fn bitmap_residency_policy(&self) -> Option<BitmapResidencyPolicy> {
         None
     }
 }

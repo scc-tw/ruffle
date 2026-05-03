@@ -1001,11 +1001,19 @@ impl<'gc> Library<'gc> {
     /// `Character<'gc>` it owned; the underlying gc-arena
     /// allocations become eligible for collection on the next
     /// sweep, at which point each `BitmapCharacter`'s
-    /// `OnceCell<BitmapHandle>` drops, releasing its
-    /// `wgpu::Texture` (subject to the renderer's queued-free
-    /// flush — see `RenderBackend::empty_submit`).
+    /// residency slot drops, releasing its `wgpu::Texture`
+    /// (subject to the renderer's queued-free flush — see
+    /// `RenderBackend::empty_submit`).
     pub fn remove_movie(&mut self, movie: &Arc<SwfMovie>) -> bool {
         self.movie_libraries.remove(movie).is_some()
+    }
+
+    /// [seer-patch P1] Iterate every loaded `MovieLibrary` for the
+    /// per-bitmap residency sweep. The returned references are
+    /// borrowed from the underlying `PtrWeakKeyHashMap`; do not
+    /// outlive `&self`.
+    pub fn iter_libraries(&self) -> impl Iterator<Item = &MovieLibrary<'gc>> + '_ {
+        self.movie_libraries.0.iter().map(|(_, lib)| lib)
     }
 }
 

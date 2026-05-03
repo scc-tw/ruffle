@@ -1,4 +1,5 @@
-use std::cell::OnceCell;
+use std::cell::RefCell;
+use std::time::Instant;
 
 use crate::backend::audio::SoundHandle;
 use crate::binary_data::BinaryData;
@@ -31,14 +32,33 @@ pub enum Character<'gc> {
     BinaryData(Gc<'gc, BinaryData>),
 }
 
+/// [seer-patch P1] Resettable GPU residency slot for a
+/// `BitmapCharacter`. Replaces the upstream `OnceCell<BitmapHandle>`
+/// to allow `Player::sweep_idle_bitmaps` to drop the GPU handle
+/// while keeping `compressed` alive on CPU heap for cheap re-decode.
+///
+/// `last_sampled` is bumped from every `bitmap_handle()` call (which
+/// is the access path for shape-pattern fills referencing this
+/// character). The sweep evicts handles whose `last_sampled` is older
+/// than `BitmapResidencyPolicy::idle_threshold`.
+#[derive(Default, Debug)]
+pub struct BitmapResidency {
+    pub handle: Option<BitmapHandle>,
+    pub last_sampled: Option<Instant>,
+}
+
 #[derive(Collect, Debug)]
 #[collect(no_drop)]
 pub struct BitmapCharacter<'gc> {
     #[collect(require_static)]
     compressed: CompressedBitmap,
-    /// A lazily constructed GPU handle, used when performing fills with this bitmap
+    /// [seer-patch P1] Lazily constructed GPU handle + sampling clock.
+    /// Used when performing fills with this bitmap (shape-pattern
+    /// fills via `MovieLibrarySource::bitmap_handle`).
+    /// `Player::sweep_idle_bitmaps` resets the inner `Option` once
+    /// the handle has been idle past the residency policy threshold.
     #[collect(require_static)]
-    handle: OnceCell<BitmapHandle>,
+    residency: RefCell<BitmapResidency>,
     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
     /// a `Bitmap` displayobject.
     avm2_class: Lock<BitmapClass<'gc>>,
@@ -48,7 +68,7 @@ impl<'gc> BitmapCharacter<'gc> {
     pub fn new(compressed: CompressedBitmap) -> Self {
         Self {
             compressed,
-            handle: OnceCell::default(),
+            residency: RefCell::new(BitmapResidency::default()),
             avm2_class: Lock::new(BitmapClass::NoSubclass),
         }
     }
@@ -69,14 +89,30 @@ impl<'gc> BitmapCharacter<'gc> {
         &self,
         backend: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, RenderError> {
-        // FIXME - use `OnceCell::get_or_try_init` when stabilized.
-        if let Some(handle) = self.handle.get() {
-            return Ok(handle.clone());
+        // [seer-patch P1] Bump touch + return cached handle if present.
+        // Drop borrow before any decode/register call so reentrant
+        // `bitmap_handle()` (e.g., from inside a backend hook) doesn't
+        // double-borrow.
+        {
+            let mut r = self.residency.borrow_mut();
+            r.last_sampled = Some(Instant::now());
+            if let Some(handle) = &r.handle {
+                return Ok(handle.clone());
+            }
         }
         let decoded = self.compressed.decode()?;
         let new_handle = backend.register_bitmap(decoded)?;
-        // FIXME - do we ever want to release this handle, to avoid taking up GPU memory?
-        self.handle.set(new_handle.clone()).unwrap();
+        // Re-borrow on store. If a concurrent reentrant call raced
+        // and populated the slot in the meantime (unlikely on the
+        // single-threaded AVM2 path, but defensive), prefer the
+        // already-stored handle and let our fresh upload drop.
+        {
+            let mut r = self.residency.borrow_mut();
+            if let Some(existing) = &r.handle {
+                return Ok(existing.clone());
+            }
+            r.handle = Some(new_handle.clone());
+        }
         Ok(new_handle)
     }
 
@@ -87,12 +123,36 @@ impl<'gc> BitmapCharacter<'gc> {
     /// Lazy (still compressed) bitmaps don't contribute — they live
     /// in heap and are accounted there.
     pub fn realised_bytes(&self) -> Option<u64> {
-        if self.handle.get().is_some() {
+        if self.residency.borrow().handle.is_some() {
             let s = self.compressed.size();
             Some(u64::from(s.width) * u64::from(s.height) * 4)
         } else {
             None
         }
+    }
+
+    /// [seer-patch P1] Whether the lazy GPU handle is currently realised.
+    pub fn is_realised(&self) -> bool {
+        self.residency.borrow().handle.is_some()
+    }
+
+    /// [seer-patch P1] Wall-clock instant of the last `bitmap_handle()`
+    /// call, or `None` if never realised. Used by the residency sweep
+    /// to identify idle handles for eviction.
+    pub fn last_sampled(&self) -> Option<Instant> {
+        self.residency.borrow().last_sampled
+    }
+
+    /// [seer-patch P1] Drop the realised GPU handle. Returns `true` if
+    /// a handle was present (i.e., the eviction did real work). The
+    /// `compressed` source bytes stay alive; the next `bitmap_handle()`
+    /// call will re-decode and re-upload.
+    ///
+    /// `last_sampled` is preserved as a hint for diagnostics — callers
+    /// can tell apart "never realised" (None) from "evicted X seconds
+    /// ago" (Some(t) with `is_realised() == false`).
+    pub fn evict_gpu(&self) -> bool {
+        self.residency.borrow_mut().handle.take().is_some()
     }
 
     /// [seer-patch] Source bytes still held in `CompressedBitmap`

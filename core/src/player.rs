@@ -2194,6 +2194,85 @@ impl Player {
         Some(report)
     }
 
+    /// [seer-patch P1] Sweep idle bitmap GPU handles. Walks every
+    /// `BitmapCharacter` in every `MovieLibrary` and every
+    /// `BitmapData` reachable from the live display tree, dropping
+    /// the GPU handle (`Arc<wgpu::Texture>`) for any that have not
+    /// been sampled within `BitmapResidencyPolicy::idle_threshold`.
+    /// The compressed source bytes (`BitmapCharacter::compressed`)
+    /// and the CPU pixel `Vec` (`BitmapRawData::pixels`) stay alive,
+    /// so the next `bitmap_handle()` / `try_bitmap_handle()` call
+    /// re-realises cheaply (no JPEG decode for `BitmapData`; one
+    /// JPEG decode for `BitmapCharacter`).
+    ///
+    /// `BitmapData` instances whose `dirty_state != Clean` are
+    /// skipped — see `BitmapRawData::evict_gpu` for rationale.
+    /// AS3-private `BitmapData` (held by AS3 ref but not on the
+    /// stage tree) is currently missed by this sweep; promotion to
+    /// a registry-based scan is tracked as Q4 in
+    /// `docs/plans/bitmap-memory.md`.
+    ///
+    /// Returns `None` if no host or no policy is installed
+    /// (upstream Ruffle behaviour).
+    pub fn sweep_idle_bitmaps(&mut self) -> Option<crate::seer::BitmapSweepReport> {
+        let host = crate::seer::host()?;
+        let policy = host.bitmap_residency_policy()?;
+
+        let now = web_time::Instant::now();
+        let mut report = crate::seer::BitmapSweepReport::default();
+
+        self.enter_arena_mut(|gc_context, gc_root, _| {
+            // Pass 1: BitmapCharacter sweep. Walk every loaded
+            // library and every Bitmap character within. Eviction
+            // is via interior mutability on `BitmapCharacter`'s
+            // `RefCell<BitmapResidency>`; no &mut needed.
+            for lib in gc_root.library.iter_libraries() {
+                for ch in lib.characters().values() {
+                    if let crate::character::Character::Bitmap(bc) = ch {
+                        if !bc.is_realised() { continue; }
+                        report.total_realised += 1;
+                        let Some(last) = bc.last_sampled() else { continue };
+                        if now.duration_since(last) < policy.idle_threshold {
+                            report.kept_realised += 1;
+                            continue;
+                        }
+                        let bytes = bc.realised_bytes().unwrap_or(0);
+                        if bc.evict_gpu() {
+                            report.evicted_chars += 1;
+                            report.freed_char_bytes =
+                                report.freed_char_bytes.saturating_add(bytes);
+                        }
+                    }
+                }
+            }
+
+            // Pass 2: BitmapData sweep via display-tree walk.
+            // Each Bitmap display object holds a BitmapData with
+            // its own GPU handle (independent of the library
+            // BitmapCharacter cache). For seer's tutorial-fight
+            // workload this is the dominant memory site — see
+            // docs/plans/bitmap-memory.md "Audit findings".
+            sweep_bitmap_data_in_tree(
+                gc_context,
+                gc_root.stage.into(),
+                now,
+                &policy,
+                &mut report,
+            );
+        });
+
+        if report.evicted_chars > 0 || report.evicted_data > 0 {
+            // See `sweep_idle_libraries` for the timing caveat: the
+            // `Arc<wgpu::Texture>` is dropped by `evict_gpu()` itself
+            // (no gc-arena collect required, since it lives in a
+            // RefCell / Cell, not Gc). The `empty_submit` advances
+            // the GPU timeline so wgpu's queued-free list can
+            // process the just-released textures.
+            self.renderer.empty_submit();
+        }
+        Some(report)
+    }
+
     /// The current frame of the main timeline, if available.
     /// The first frame is frame 1.
     pub fn current_frame(&self) -> Option<u16> {
@@ -3298,6 +3377,62 @@ fn collect_live_movies_into<'gc>(
     if let Some(container) = node.as_container() {
         for child in container.iter_render_list() {
             collect_live_movies_into(child, out);
+        }
+    }
+}
+
+/// [seer-patch P1] Recursively walk the display tree, dropping the
+/// GPU handle on every `Bitmap` display object's `BitmapData` whose
+/// last sample is older than `policy.idle_threshold`. The `pixels`
+/// Vec stays alive for cheap re-upload on next render.
+///
+/// `BitmapData` whose `dirty_state != Clean` are skipped — see
+/// `BitmapRawData::evict_gpu` for rationale (would lose pending
+/// state). They contribute to `report.kept_realised` so the user
+/// can tell apart "kept idle" from "skipped dirty".
+fn sweep_bitmap_data_in_tree<'gc>(
+    mc: &gc_arena::Mutation<'gc>,
+    node: crate::display_object::DisplayObject<'gc>,
+    now: web_time::Instant,
+    policy: &crate::seer::BitmapResidencyPolicy,
+    report: &mut crate::seer::BitmapSweepReport,
+) {
+    use crate::display_object::TDisplayObject;
+
+    if let Some(bitmap) = node.as_bitmap() {
+        let bd = bitmap.bitmap_data();
+        if bd.is_realised() {
+            report.total_realised += 1;
+            // Compute bytes-on-GPU before deciding eviction so the
+            // accounting reflects the same instant the policy decides.
+            let (w, h) = (bitmap.bitmap_width() as u64, bitmap.bitmap_height() as u64);
+            let bytes = w.saturating_mul(h).saturating_mul(4);
+
+            let evict_eligible = match bd.last_sampled() {
+                Some(last) => now.duration_since(last) >= policy.idle_threshold,
+                // Realised but never sampled? Should not normally
+                // happen, but treat as evictable to recover memory.
+                None => true,
+            };
+
+            if !evict_eligible {
+                report.kept_realised += 1;
+            } else if !bd.dirty_state_is_clean() {
+                // Pending CPU- or GPU-side changes — skip; let the
+                // sync path resolve them. Counted as "kept" rather
+                // than evicted.
+                report.kept_realised += 1;
+            } else if bd.evict_gpu(mc) {
+                report.evicted_data += 1;
+                report.freed_data_bytes =
+                    report.freed_data_bytes.saturating_add(bytes);
+            }
+        }
+    }
+
+    if let Some(container) = node.as_container() {
+        for child in container.iter_render_list() {
+            sweep_bitmap_data_in_tree(mc, child, now, policy, report);
         }
     }
 }

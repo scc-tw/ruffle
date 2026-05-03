@@ -360,6 +360,33 @@ impl<'gc> BitmapData<'gc> {
     pub fn ptr_eq(&self, other: BitmapData<'gc>) -> bool {
         self.0.ptr_eq(other.0)
     }
+
+    /// [seer-patch P1] Whether the lazy GPU handle is currently
+    /// realised on this BitmapData. Read-only, no GPU sync.
+    pub fn is_realised(&self) -> bool {
+        self.0.is_realised()
+    }
+
+    /// [seer-patch P1] Wall-clock instant of the most recent
+    /// `try_bitmap_handle()` call, or `None` if never realised.
+    pub fn last_sampled(&self) -> Option<std::time::Instant> {
+        self.0.last_sampled()
+    }
+
+    /// [seer-patch P1] Whether `dirty_state == Clean`. The residency
+    /// sweep skips eviction when state is dirty (would lose pending
+    /// pixel changes). Read-only, no GPU sync.
+    pub fn dirty_state_is_clean(&self) -> bool {
+        self.0.dirty_state_is_clean()
+    }
+
+    /// [seer-patch P1] Drop the realised GPU handle. Returns `true`
+    /// if a handle was present AND `dirty_state == Clean`. The CPU
+    /// `pixels` Vec stays alive; next `try_bitmap_handle()` re-uploads
+    /// from CPU pixels (no JPEG decode needed for this path).
+    pub fn evict_gpu(&self, mc: &Mutation<'gc>) -> bool {
+        self.0.evict_gpu(mc)
+    }
 }
 
 #[derive(Collect)]
@@ -384,6 +411,15 @@ pub struct BitmapRawData<'gc> {
     /// initialization has not yet happened.
     #[collect(require_static)]
     bitmap_handle: Option<BitmapHandle>,
+
+    /// [seer-patch P1] Wall-clock instant of the most recent
+    /// `bitmap_handle()` call. Used by `Player::sweep_idle_bitmaps`
+    /// to identify per-instance GPU handles whose backing
+    /// `Arc<wgpu::Texture>` can be dropped (the next sample re-uploads
+    /// from `pixels`). `None` until the handle is first realised; once
+    /// set it is preserved across evictions for diagnostics.
+    #[collect(require_static)]
+    last_sampled: std::cell::Cell<Option<std::time::Instant>>,
 
     /// The AVM2 side of this `BitmapData`.
     ///
@@ -481,6 +517,7 @@ mod wrapper {
                     transparency: false,
                     disposed: true,
                     bitmap_handle: None,
+                    last_sampled: std::cell::Cell::new(None),
                     avm2_object: None,
                     display_objects: vec![],
                     dirty_state: DirtyState::Clean,
@@ -504,6 +541,7 @@ mod wrapper {
                 transparency: data.transparency,
                 disposed: data.disposed,
                 bitmap_handle: None,
+                last_sampled: std::cell::Cell::new(None),
                 avm2_object: None,
                 display_objects: vec![],
                 // We have no GPU texture, so there's no need to mark as dirty
@@ -511,6 +549,36 @@ mod wrapper {
                 #[cfg(feature = "egui")]
                 egui_texture: Default::default(),
             }
+        }
+
+        /// [seer-patch P1] Read-only residency accessors that bypass
+        /// `sync()` — they don't need CPU pixel access, so triggering
+        /// a GPU→CPU readback would be wasteful.
+        ///
+        /// Safe because we only read scalar fields
+        /// (`bitmap_handle.is_some()`, `last_sampled.get()`).
+        pub fn is_realised(&self) -> bool {
+            self.0.borrow().is_realised()
+        }
+
+        pub fn last_sampled(&self) -> Option<std::time::Instant> {
+            self.0.borrow().last_sampled()
+        }
+
+        pub fn dirty_state_is_clean(&self) -> bool {
+            matches!(self.0.borrow().dirty_state, DirtyState::Clean)
+        }
+
+        /// [seer-patch P1] Drop the GPU handle. Skipped if
+        /// `dirty_state != Clean` (would lose pending state). Returns
+        /// true if eviction did real work. Same `Write::assume` dance
+        /// as `sync()` since `BitmapRawData` lives in a `GcRefLock`.
+        pub fn evict_gpu(&self, mc: &Mutation<'gc>) -> bool {
+            let mut write = unsafe { Write::assume(Gc::as_ref(self.0)) }
+                .unlock()
+                .borrow_mut();
+            let _ = mc; // mc is needed for the Write::assume contract
+            write.evict_gpu()
         }
 
         // Provides access to the underlying `BitmapData`. If a GPU -> CPU sync
@@ -739,6 +807,7 @@ impl<'gc> BitmapRawData<'gc> {
             transparency,
             disposed: false,
             bitmap_handle: None,
+            last_sampled: std::cell::Cell::new(None),
             avm2_object: None,
             display_objects: vec![],
             dirty_state: DirtyState::Clean,
@@ -759,6 +828,7 @@ impl<'gc> BitmapRawData<'gc> {
             height,
             transparency,
             bitmap_handle: None,
+            last_sampled: std::cell::Cell::new(None),
             avm2_object: None,
             disposed: false,
             dirty_state: DirtyState::Clean,
@@ -786,6 +856,14 @@ impl<'gc> BitmapRawData<'gc> {
         &mut self,
         renderer: &mut dyn RenderBackend,
     ) -> Result<BitmapHandle, ruffle_render::error::Error> {
+        // [seer-patch P1] Bump the residency clock on every realisation
+        // probe — including hits — so `Player::sweep_idle_bitmaps` sees
+        // the most recent sample. The `Cell` allows this from `&self`
+        // contexts; on this method we already have `&mut self` so a
+        // direct set is fine, but going through `Cell::set` keeps the
+        // access pattern uniform with the eviction sweep.
+        self.last_sampled.set(Some(std::time::Instant::now()));
+
         if let Some(ref handle) = self.bitmap_handle {
             return Ok(handle.clone());
         }
@@ -802,6 +880,39 @@ impl<'gc> BitmapRawData<'gc> {
             self.bitmap_handle = Some(handle.clone());
         }
         bitmap_handle
+    }
+
+    /// [seer-patch P1] Whether the lazy GPU handle is currently realised.
+    pub fn is_realised(&self) -> bool {
+        self.bitmap_handle.is_some()
+    }
+
+    /// [seer-patch P1] Wall-clock instant of the most recent
+    /// `try_bitmap_handle` / `bitmap_handle` call, or `None` if never
+    /// realised. Used by the residency sweep to identify idle handles
+    /// for eviction.
+    pub fn last_sampled(&self) -> Option<std::time::Instant> {
+        self.last_sampled.get()
+    }
+
+    /// [seer-patch P1] Drop the realised GPU handle. Returns `true` if
+    /// a handle was present (i.e., the eviction did real work). The
+    /// `pixels` Vec stays alive; the next `try_bitmap_handle` call
+    /// re-uploads to a fresh `wgpu::Texture` from CPU pixels.
+    ///
+    /// **Refuses to evict if `dirty_state != Clean`** — a `CpuModified`
+    /// or `GpuModified` state means there's pending state that would
+    /// be lost. The sweep should skip these and let the natural
+    /// `update_dirty_texture` / `sync` path resolve them first.
+    ///
+    /// `last_sampled` is preserved as a hint for diagnostics — callers
+    /// can tell apart "never realised" (None) from "evicted N seconds
+    /// ago" (Some(t) with `is_realised() == false`).
+    pub fn evict_gpu(&mut self) -> bool {
+        if !matches!(self.dirty_state, DirtyState::Clean) {
+            return false;
+        }
+        self.bitmap_handle.take().is_some()
     }
 
     pub fn bitmap_handle(&mut self, renderer: &mut dyn RenderBackend) -> BitmapHandle {
