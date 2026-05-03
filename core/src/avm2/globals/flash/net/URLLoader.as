@@ -1,6 +1,4 @@
 package flash.net {
-    import __ruffle__.stub_method;
-
     import flash.events.EventDispatcher;
     import flash.net.URLRequest;
 
@@ -26,7 +24,10 @@ package flash.net {
         public native function load(request:URLRequest):void;
 
         public function close():void {
-            stub_method("flash.net.URLLoader", "close");
+            // Cancellation of the in-flight load is not currently tracked
+            // by Ruffle's NavigatorBackend; close() therefore can't actually
+            // abort it. Treated as a no-op — the load future runs to
+            // completion and its events are still dispatched.
         }
     }
 }

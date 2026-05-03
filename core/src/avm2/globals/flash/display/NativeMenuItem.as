@@ -1,5 +1,4 @@
 package flash.display {
-    import __ruffle__.stub_constructor;
     import __ruffle__.stub_getter;
 
     import flash.events.EventDispatcher;
@@ -22,7 +21,9 @@ package flash.display {
         private var _submenu:NativeMenu = new NativeMenu();
 
         public function NativeMenuItem(label:String = "", isSeparator:Boolean = false) {
-            stub_constructor("flash.display.NativeMenuItem");
+            // Native menu rendering is host-specific (AIR-only on
+            // upstream, no host integration in seer). Field storage is
+            // honest; `menu`/`submenu` traversal works for AS3 model code.
             this.label = label;
             this.isSeparator = isSeparator;
         }

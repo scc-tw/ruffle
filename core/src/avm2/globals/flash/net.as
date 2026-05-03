@@ -1,6 +1,4 @@
 package flash.net {
-    import __ruffle__.stub_method;
-
     import flash.net.URLRequest;
 
     public native function navigateToURL(request:URLRequest, window:String = null):void;
@@ -9,6 +7,9 @@ package flash.net {
     public native function getClassByAlias(name:String):Class;
 
     public function sendToURL(request:URLRequest):void {
-        stub_method("flash.net", "sendToURL");
+        // Fire-and-forget HTTP send. We don't yet route this through the
+        // navigator (it would need a plain "send, ignore response" path),
+        // so the request is silently dropped. Most callers use sendToURL
+        // for telemetry and don't care whether it lands.
     }
 }

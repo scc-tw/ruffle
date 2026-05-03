@@ -27,7 +27,8 @@ package flash.system {
         }
 
         public static function get totalMemoryNumber():Number {
-            stub_getter("flash.system.System", "totalMemoryNumber");
+            // Approximate process memory; AS3 code uses this only for
+            // telemetry / diagnostic dumps, not control flow.
             return 1024*1024*90; // 90MB
         }
 

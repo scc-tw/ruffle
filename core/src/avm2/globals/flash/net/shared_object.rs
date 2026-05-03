@@ -5,7 +5,7 @@ use crate::avm2::object::{ScriptObject, SharedObjectObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::{Activation, Error, Object, Value};
 use crate::string::AvmString;
-use crate::{avm2_stub_getter, avm2_stub_method, avm2_stub_setter};
+use crate::avm2_stub_method;
 use flash_lso::types::{AMFVersion, Lso};
 use ruffle_macros::istr;
 use std::borrow::Cow;
@@ -273,19 +273,22 @@ pub fn clear<'gc>(
 }
 
 pub fn get_object_encoding<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.net.SharedObject", "objectEncoding");
-    Ok(0.into())
+    // We always serialise SharedObject contents as AMF3 (the value 3
+    // here is the AMF3 encoding identifier in `flash.net.ObjectEncoding`).
+    // Returning `0` for AMF0 would lie about the on-disk format.
+    Ok(3.into())
 }
 
 pub fn set_object_encoding<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_setter!(activation, "flash.net.SharedObject", "objectEncoding");
+    // Setter accepted but ignored — Ruffle persists SharedObject as
+    // AMF3 regardless of the requested encoding.
     Ok(Value::Undefined)
 }

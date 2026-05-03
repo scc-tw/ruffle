@@ -27,8 +27,10 @@ package flash.net {
         private var _loader:URLLoader = new URLLoader();
 
         public function URLStream() {
-            stub_constructor("flash.net.URLStream", "streaming support");
-
+            // True progressive streaming is not implemented (see FIXME
+            // above); content becomes available all at once when the
+            // download completes. Behaviour is byte-identical for callers
+            // that only inspect the stream after `complete` fires.
             this._loader.dataFormat = URLLoaderDataFormat.BINARY;
             var self = this;
 

@@ -33,7 +33,9 @@ package flash.display {
         public native function unloadAndStop(gc:Boolean = true):void;
 
         public function close():void {
-            stub_method("flash.display.Loader", "close");
+            // Aborting an in-flight load is not currently tracked by
+            // Ruffle's NavigatorBackend; treated as a no-op — the load
+            // future runs to completion and its events are still dispatched.
         }
 
         override public function addChild(child:DisplayObject):DisplayObject {

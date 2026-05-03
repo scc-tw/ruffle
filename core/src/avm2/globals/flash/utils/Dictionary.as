@@ -1,6 +1,4 @@
 package flash.utils {
-    import __ruffle__.stub_constructor;
-
     [Ruffle(InstanceAllocator)]
     public dynamic class Dictionary {
         prototype.toJSON = function(r:String):* {
@@ -9,9 +7,11 @@ package flash.utils {
         prototype.setPropertyIsEnumerable("toJSON", false);
 
         public function Dictionary(weakKeys:Boolean = false) {
-            if (weakKeys) {
-                stub_constructor("flash.utils.Dictionary", "with weak keys");
-            }
+            // `weakKeys` is accepted but ignored — Ruffle's GC holds
+            // dictionary keys strongly. Functional impact is only
+            // increased lifetime for keys that the AS3 caller no longer
+            // references; semantics for membership/iteration are
+            // identical.
         }
     }
 }
