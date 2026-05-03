@@ -141,6 +141,11 @@ impl Default for BitmapResidencyPolicy {
 /// [seer-patch P1] Stats returned by `Player::sweep_idle_bitmaps`.
 /// Hosts use these to format a `[bitmap-sweep]` log line and feed
 /// the memory-pressure overlay.
+///
+/// Split into char- and data-side counters so logs can distinguish
+/// "no bitmap display objects in tree" (data totals = 0) from
+/// "found them but kept all of them" (data totals > 0, evicted_data
+/// = 0). See `docs/plans/bitmap-memory.md` Q4 for context.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BitmapSweepReport {
     /// Number of `BitmapCharacter` GPU handles dropped this sweep.
@@ -154,14 +159,23 @@ pub struct BitmapSweepReport {
     pub freed_char_bytes: u64,
     /// Estimated GPU bytes freed across `BitmapData` evictions.
     pub freed_data_bytes: u64,
-    /// Number of realised handles inspected this sweep that were
-    /// kept (recently sampled within the idle threshold).
-    pub kept_realised: usize,
-    /// Total realised handles inspected this sweep (across both
-    /// `BitmapCharacter` and `BitmapData`). Equals
-    /// `kept_realised + evicted_chars + evicted_data` modulo any
-    /// dirty-state skips.
-    pub total_realised: usize,
+    /// Number of realised `BitmapCharacter` handles kept this sweep
+    /// (recently sampled within the idle threshold).
+    pub kept_chars: usize,
+    /// Number of realised `BitmapData` handles kept this sweep
+    /// (recently sampled within the idle threshold OR dirty_state
+    /// not Clean).
+    pub kept_data: usize,
+    /// Total realised `BitmapCharacter` handles inspected.
+    pub total_chars_realised: usize,
+    /// Total realised `BitmapData` handles inspected (visited via
+    /// the display-tree walk).
+    pub total_data_realised: usize,
+    /// `BitmapData`s skipped because `dirty_state != Clean`. Counted
+    /// separately from `kept_data` (which is "kept due to recent
+    /// sample") so we can tell apart the two skip reasons. Subset
+    /// of `total_data_realised`; not double-counted in `kept_data`.
+    pub skipped_dirty: usize,
 }
 
 /// One snapshot of a `MovieLibrary`'s memory footprint. Returned

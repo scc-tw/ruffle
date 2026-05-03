@@ -2124,15 +2124,25 @@ impl Player {
         let root_swf = self.swf.clone();
         let mut report = crate::seer::SweepReport::default();
 
-        self.enter_arena_mut(|_, gc_root, _| {
+        self.enter_arena_mut(|gc_context, gc_root, _| {
             // [seer-patch] Build the "live movie" set by walking the
             // stage's display tree. This is the eviction gate's only
             // liveness signal — see `Library::abandonable_movies` for
             // why `Arc::strong_count` was the wrong choice (AVM2
             // Scripts inside the lib's own domain hold internal
             // movie clones that inflated the count).
+            //
+            // [seer-patch P1] Also include orphans (AVM2 MovieClips
+            // whose parent was removed but timeline still runs —
+            // matches Flash semantics). Their `place_object Replace`
+            // tags reference characters that must stay live. Without
+            // this we'd get a flood of "PlaceObject: expected Graphic
+            // at character ID N" warnings.
             let mut live: fnv::FnvHashSet<*const SwfMovie> = fnv::FnvHashSet::default();
             collect_live_movies_into(gc_root.stage.into(), &mut live);
+            for orphan in gc_root.orphan_manager.iter_live(gc_context) {
+                collect_live_movies_into(orphan, &mut live);
+            }
 
             // Pass 1: collect (arc, bitmap_bytes) for evictables,
             // skipping the root SWF if the policy says so.
@@ -2230,10 +2240,10 @@ impl Player {
                 for ch in lib.characters().values() {
                     if let crate::character::Character::Bitmap(bc) = ch {
                         if !bc.is_realised() { continue; }
-                        report.total_realised += 1;
+                        report.total_chars_realised += 1;
                         let Some(last) = bc.last_sampled() else { continue };
                         if now.duration_since(last) < policy.idle_threshold {
-                            report.kept_realised += 1;
+                            report.kept_chars += 1;
                             continue;
                         }
                         let bytes = bc.realised_bytes().unwrap_or(0);
@@ -2259,6 +2269,21 @@ impl Player {
                 &policy,
                 &mut report,
             );
+            // [seer-patch P1] Also walk orphan MovieClips so
+            // `Bitmap` display objects parented under an orphan
+            // get their `BitmapData` GPU handles considered for
+            // eviction. Orphans run timelines indefinitely and
+            // can hold Bitmap display objects that contribute to
+            // the working set.
+            for orphan in gc_root.orphan_manager.iter_live(gc_context) {
+                sweep_bitmap_data_in_tree(
+                    gc_context,
+                    orphan,
+                    now,
+                    &policy,
+                    &mut report,
+                );
+            }
         });
 
         if report.evicted_chars > 0 || report.evicted_data > 0 {
@@ -3374,8 +3399,19 @@ fn collect_live_movies_into<'gc>(
     out: &mut fnv::FnvHashSet<*const SwfMovie>,
 ) {
     out.insert(Arc::as_ptr(&node.movie()));
+    // [seer-patch P1] Walk both render_list AND depth_list children.
+    // Depth-list-only children (AVM1 pending removals at negative
+    // depths, timeline-placed orphans) can replay `place_object`
+    // tags that need their source library still live. Restricting
+    // to render_list caused a flood of
+    // `PlaceObject: expected Graphic at character ID N` warnings
+    // from `display_object/graphic.rs::replace_with` when the lib
+    // sweep evicted a library whose only live references were in
+    // depth_list. See
+    // `display_object/container.rs::collect_depth_and_render_children`.
     if let Some(container) = node.as_container() {
-        for child in container.iter_render_list() {
+        let children = container.raw_container().collect_depth_and_render_children();
+        for child in children {
             collect_live_movies_into(child, out);
         }
     }
@@ -3402,7 +3438,7 @@ fn sweep_bitmap_data_in_tree<'gc>(
     if let Some(bitmap) = node.as_bitmap() {
         let bd = bitmap.bitmap_data();
         if bd.is_realised() {
-            report.total_realised += 1;
+            report.total_data_realised += 1;
             // Compute bytes-on-GPU before deciding eviction so the
             // accounting reflects the same instant the policy decides.
             let (w, h) = (bitmap.bitmap_width() as u64, bitmap.bitmap_height() as u64);
@@ -3416,12 +3452,11 @@ fn sweep_bitmap_data_in_tree<'gc>(
             };
 
             if !evict_eligible {
-                report.kept_realised += 1;
+                report.kept_data += 1;
             } else if !bd.dirty_state_is_clean() {
                 // Pending CPU- or GPU-side changes — skip; let the
-                // sync path resolve them. Counted as "kept" rather
-                // than evicted.
-                report.kept_realised += 1;
+                // sync path resolve them.
+                report.skipped_dirty += 1;
             } else if bd.evict_gpu(mc) {
                 report.evicted_data += 1;
                 report.freed_data_bytes =
@@ -3430,8 +3465,14 @@ fn sweep_bitmap_data_in_tree<'gc>(
         }
     }
 
+    // [seer-patch P1] Walk both render_list AND depth_list children.
+    // The depth-list-only children (AVM1 pending removals at negative
+    // depths, etc.) can hold timeline-driven `place_object Replace`
+    // tags whose source library still needs to stay live. See
+    // `display_object/container.rs::collect_depth_and_render_children`.
     if let Some(container) = node.as_container() {
-        for child in container.iter_render_list() {
+        let children = container.raw_container().collect_depth_and_render_children();
+        for child in children {
             sweep_bitmap_data_in_tree(mc, child, now, policy, report);
         }
     }

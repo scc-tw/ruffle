@@ -1092,6 +1092,42 @@ impl<'gc> ChildContainer<'gc> {
         self.render_list.iter().copied()
     }
 
+    /// [seer-patch P1] Collect every child reachable from this
+    /// container via either the render list or the depth list,
+    /// without duplicates. Render-list children come first.
+    ///
+    /// Why both: the depth list can hold timeline-placed children
+    /// at negative depths (AVM1 pending removals) and other
+    /// renderer-invisible nodes that are still alive from the
+    /// timeline tag's perspective. `Player::sweep_idle_libraries`
+    /// and `Player::sweep_idle_bitmaps` need the union — otherwise
+    /// they evict libraries that have a `place_object Replace`
+    /// scheduled to fire on the next frame, producing a flood of
+    /// `PlaceObject: expected Graphic at character ID N` warnings
+    /// (see `display_object/graphic.rs::replace_with`).
+    ///
+    /// Returns a `Vec` rather than an iterator because the sweep
+    /// path is throttled (~0.5 Hz) so allocation cost is irrelevant
+    /// and the simpler signature plays better with recursive walks.
+    pub fn collect_depth_and_render_children(&self) -> Vec<DisplayObject<'gc>> {
+        let mut out = Vec::with_capacity(self.render_list.len() + self.depth_list.len());
+        let mut seen: Vec<*const ()> = Vec::with_capacity(out.capacity());
+        let push_unique = |child: DisplayObject<'gc>, out: &mut Vec<_>, seen: &mut Vec<_>| {
+            let p = child.as_ptr() as *const ();
+            if !seen.contains(&p) {
+                seen.push(p);
+                out.push(child);
+            }
+        };
+        for child in self.render_list.iter().copied() {
+            push_unique(child, &mut out, &mut seen);
+        }
+        for child in self.depth_list.values().copied() {
+            push_unique(child, &mut out, &mut seen);
+        }
+        out
+    }
+
     /// Check for pending removals and update the pending removals flag
     pub fn update_pending_removals(&mut self) {
         self.has_pending_removals = self.depth_list.values().any(|c| c.avm1_pending_removal());

@@ -101,6 +101,31 @@ impl<'gc> Default for OrphanManager<'gc> {
     }
 }
 
+impl<'gc> OrphanManager<'gc> {
+    /// [seer-patch P1] Iterate live orphans without needing
+    /// `UpdateContext` (unlike `each_orphan_obj`). Used by
+    /// `Player::sweep_idle_libraries` and
+    /// `Player::sweep_idle_bitmaps` to include orphan MovieClips
+    /// in the live-movie set — orphans run their timeline frames
+    /// indefinitely (matching Flash semantics) and can fire
+    /// `place_object Replace` tags whose source library still
+    /// needs to stay live. Otherwise we get a flood of
+    /// `PlaceObject: expected Graphic at character ID N` warnings
+    /// from `display_object/graphic.rs::replace_with`.
+    ///
+    /// Yields only orphans that still upgrade AND have no parent
+    /// (matching `valid_orphan`'s definition of "live orphan");
+    /// the rest are dead-weak entries pending `cleanup_dead_orphans`.
+    pub fn iter_live<'a>(
+        &'a self,
+        mc: &'a Mutation<'gc>,
+    ) -> impl Iterator<Item = DisplayObject<'gc>> + 'a {
+        self.orphans
+            .iter()
+            .filter_map(move |w| valid_orphan(*w, mc))
+    }
+}
+
 /// If the provided `DisplayObjectWeak` should have frames run, returns
 /// Some(clip) with an upgraded `MovieClip`.
 /// If this returns `None`, the entry should be removed from the orphan list.
