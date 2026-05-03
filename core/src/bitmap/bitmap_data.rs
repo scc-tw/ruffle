@@ -12,6 +12,7 @@ use ruffle_wstr::WStr;
 use std::cell::Ref;
 use std::fmt::Debug;
 use std::ops::Range;
+use std::sync::Arc;
 use swf::{Rectangle, Twips};
 use tracing::instrument;
 
@@ -251,6 +252,24 @@ impl<'gc> BitmapData<'gc> {
         Self(data)
     }
 
+    /// [seer-patch P1.5] Construct from a pre-shared pixel `Arc`.
+    /// Used by `Bitmap::new_with_shared_pixels` so that multiple
+    /// `Bitmap` display object instances of the same library
+    /// `BitmapCharacter` share one pixel allocation. AS3 mutations
+    /// trigger COW on the `BitmapRawData` side.
+    pub fn new_with_shared_pixels(
+        mc: &Mutation<'gc>,
+        width: u32,
+        height: u32,
+        transparency: bool,
+        pixels: Arc<Vec<Color>>,
+    ) -> Self {
+        let data =
+            BitmapRawData::new_with_shared_pixels(width, height, transparency, pixels);
+        let data = BitmapRawDataWrapper::new(Gc::new(mc, data.into()));
+        Self(data)
+    }
+
     pub fn dummy(mc: &Mutation<'gc>) -> Self {
         Self(BitmapRawDataWrapper::dummy(mc))
     }
@@ -392,9 +411,16 @@ impl<'gc> BitmapData<'gc> {
 #[derive(Collect)]
 #[collect(no_drop)]
 pub struct BitmapRawData<'gc> {
-    /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values
+    /// The pixels in the bitmap, stored as a array of pre-multiplied ARGB colour values.
+    ///
+    /// [seer-patch P1.5] Wrapped in `Arc<Vec<Color>>` so multiple
+    /// `Bitmap` display object instances of the same library
+    /// `BitmapCharacter` share one allocation. AS3 mutations
+    /// (`setPixel32`, `fill`, `BitmapData.draw`) trigger COW via
+    /// `Arc::make_mut`. Most pet/skill sprites are read-only after
+    /// instantiation, so the COW path is rare.
     #[collect(require_static)]
-    pixels: Vec<Color>,
+    pixels: Arc<Vec<Color>>,
 
     width: u32,
     height: u32,
@@ -463,6 +489,7 @@ mod wrapper {
     use ruffle_render::bitmap::{BitmapHandle, PixelRegion, PixelSnapping};
     use ruffle_render::commands::CommandHandler;
     use std::cell::Ref;
+    use std::sync::Arc;
 
     use super::{BitmapRawData, DirtyState, copy_pixels_to_bitmapdata};
 
@@ -511,7 +538,7 @@ mod wrapper {
             BitmapRawDataWrapper(Gc::new(
                 mc,
                 BitmapRawData {
-                    pixels: Vec::new(),
+                    pixels: Arc::new(Vec::new()),
                     width: 0,
                     height: 0,
                     transparency: false,
@@ -798,10 +825,10 @@ impl std::fmt::Debug for BitmapRawData<'_> {
 impl<'gc> BitmapRawData<'gc> {
     pub fn new(width: u32, height: u32, transparency: bool, fill_color: u32) -> Self {
         Self {
-            pixels: vec![
+            pixels: Arc::new(vec![
                 Color::bgra_u32(fill_color).to_premultiplied_alpha(transparency);
                 width as usize * height as usize
-            ],
+            ]),
             width,
             height,
             transparency,
@@ -821,6 +848,21 @@ impl<'gc> BitmapRawData<'gc> {
         height: u32,
         transparency: bool,
         pixels: Vec<Color>,
+    ) -> Self {
+        Self::new_with_shared_pixels(width, height, transparency, Arc::new(pixels))
+    }
+
+    /// [seer-patch P1.5] Construct from a pre-shared pixel `Arc`. Used
+    /// by `Bitmap::new` when instantiating a `Bitmap` display object
+    /// from a library `BitmapCharacter` so that sibling instances of
+    /// the same character share one pixel buffer (instead of decoding
+    /// + copying once per instance). AS3 mutations (`setPixel32`,
+    /// `fill`, `BitmapData.draw`) trigger COW via `Arc::make_mut`.
+    pub fn new_with_shared_pixels(
+        width: u32,
+        height: u32,
+        transparency: bool,
+        pixels: Arc<Vec<Color>>,
     ) -> Self {
         Self {
             pixels,
@@ -845,7 +887,10 @@ impl<'gc> BitmapRawData<'gc> {
     pub fn dispose(&mut self) {
         self.width = 0;
         self.height = 0;
-        self.pixels = Vec::new(); // free the CPU pixel buffer
+        // [seer-patch P1.5] Replace with empty Arc rather than draining
+        // the existing one; if other clones exist (Arc-shared with
+        // siblings), they retain their pixels independently.
+        self.pixels = Arc::new(Vec::new());
         self.bitmap_handle = None;
         // There's no longer a handle to update
         self.dirty_state = DirtyState::Clean;
@@ -984,20 +1029,22 @@ impl<'gc> BitmapRawData<'gc> {
 
     #[inline]
     pub fn set_pixel32_raw(&mut self, x: u32, y: u32, color: Color) {
-        self.pixels[(x + y * self.width) as usize] = color;
+        // [seer-patch P1.5] COW: trigger Arc::make_mut so writes don't
+        // leak into sibling Bitmap instances sharing the same pixel Arc.
+        Arc::make_mut(&mut self.pixels)[(x + y * self.width) as usize] = color;
     }
 
     #[inline]
     pub fn set_pixel32_row_raw(&mut self, x1: u32, x2: u32, y: u32, color: Color) {
         let p1 = (x1 + y * self.width) as usize;
         let p2 = (x2 + y * self.width) as usize;
-        let slice = &mut self.pixels[p1..p2];
+        let slice = &mut Arc::make_mut(&mut self.pixels)[p1..p2];
         slice.fill(color);
     }
 
     #[inline]
     pub fn fill(&mut self, color: Color) {
-        self.pixels.fill(color);
+        Arc::make_mut(&mut self.pixels).fill(color);
     }
 
     #[inline]
@@ -1005,8 +1052,12 @@ impl<'gc> BitmapRawData<'gc> {
         self.pixels[(x + y * self.width()) as usize]
     }
 
+    /// [seer-patch P1.5] Returns a `&mut Vec<Color>`, triggering the
+    /// COW path if the pixel buffer is currently shared with sibling
+    /// `BitmapData` instances. Subsequent reads of `pixels` see the
+    /// new owned vec.
     pub fn raw_pixels_mut(&mut self) -> &mut Vec<Color> {
-        &mut self.pixels
+        Arc::make_mut(&mut self.pixels)
     }
 
     pub fn raw_pixels(&self) -> &[Color] {

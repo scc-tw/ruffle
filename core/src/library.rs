@@ -379,10 +379,24 @@ impl<'gc> MovieLibrary<'gc> {
         match character {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();
-                let bitmap = bitmap.compressed().decode().unwrap();
-                let bitmap = Bitmap::new(mc, id, bitmap, self.swf.clone());
-                bitmap.set_avm2_bitmapdata_class(mc, avm2_class);
-                Some(bitmap.instantiate(mc))
+                // [seer-patch P1.5] Use the character's shared pixel
+                // Arc instead of decoding fresh per instantiation.
+                // First call decodes once and caches; sibling
+                // instantiations share via Arc::clone (no decode,
+                // no pixel-Vec duplication). AS3 mutations COW.
+                let (pixels, transparency) = bitmap.shared_pixels().unwrap();
+                let size = bitmap.compressed().size();
+                let bitmap_do = Bitmap::new_with_shared_pixels(
+                    mc,
+                    id,
+                    size.width,
+                    size.height,
+                    transparency,
+                    pixels,
+                    &self.swf,
+                );
+                bitmap_do.set_avm2_bitmapdata_class(mc, avm2_class);
+                Some(bitmap_do.instantiate(mc))
             }
             Character::EditText(edit_text) => Some(edit_text.instantiate(mc)),
             Character::Graphic(graphic) => Some(graphic.instantiate(mc)),

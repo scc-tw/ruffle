@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::backend::audio::SoundHandle;
@@ -59,6 +60,24 @@ pub struct BitmapCharacter<'gc> {
     /// the handle has been idle past the residency policy threshold.
     #[collect(require_static)]
     residency: RefCell<BitmapResidency>,
+    /// [seer-patch P1.5] Shared decoded pixel buffer + transparency
+    /// flag. First call to `shared_pixels()` decodes `compressed`
+    /// once and stores the result here as an `Arc`; subsequent
+    /// calls return `Arc::clone` (no re-decode). Every `Bitmap::new`
+    /// instantiation from this character's library entry shares the
+    /// same `Arc<Vec<Color>>` — AS3 mutations COW via `Arc::make_mut`
+    /// on the BitmapData side.
+    ///
+    /// Stored alongside transparency so callers don't have to
+    /// re-derive from `CompressedBitmap`. `Color` is path-qualified
+    /// to avoid a `use` dependency on bitmap_data internals.
+    #[collect(require_static)]
+    pixels_cache: RefCell<
+        Option<(
+            Arc<Vec<crate::bitmap::bitmap_data::Color>>,
+            bool,
+        )>,
+    >,
     /// The bitmap class set by `SymbolClass` - this is used when we instantaite
     /// a `Bitmap` displayobject.
     avm2_class: Lock<BitmapClass<'gc>>,
@@ -69,6 +88,7 @@ impl<'gc> BitmapCharacter<'gc> {
         Self {
             compressed,
             residency: RefCell::new(BitmapResidency::default()),
+            pixels_cache: RefCell::new(None),
             avm2_class: Lock::new(BitmapClass::NoSubclass),
         }
     }
@@ -161,6 +181,61 @@ impl<'gc> BitmapCharacter<'gc> {
     /// the heap-side cost of un-decoded image source per SWF.
     pub fn compressed_source_bytes(&self) -> u64 {
         self.compressed.source_bytes()
+    }
+
+    /// [seer-patch P1.5] Decode `compressed` once, return the result
+    /// as a shared `Arc<Vec<Color>>`. First call decodes + populates
+    /// the cache; subsequent calls return `Arc::clone` of the cached
+    /// vec. Used by `library.rs::instantiate_display_object`'s
+    /// `Character::Bitmap` arm so every `Bitmap` display object
+    /// instantiated from this character shares one pixel buffer.
+    ///
+    /// AS3 mutations on the resulting `BitmapData` go through
+    /// `Arc::make_mut`, producing an owned copy on first write —
+    /// the cache here is unaffected (still shared by other
+    /// non-mutated siblings).
+    pub fn shared_pixels(
+        &self,
+    ) -> Result<
+        (Arc<Vec<crate::bitmap::bitmap_data::Color>>, bool),
+        RenderError,
+    > {
+        // Fast path: already decoded.
+        if let Some((arc, transparent)) = self.pixels_cache.borrow().as_ref() {
+            return Ok((Arc::clone(arc), *transparent));
+        }
+        // Decode. Drop borrow first — `compressed.decode()` doesn't
+        // touch `pixels_cache` but be defensive about reentrancy.
+        let bitmap = self.compressed.decode()?;
+        let transparent = matches!(
+            bitmap.format(),
+            ruffle_render::bitmap::BitmapFormat::Rgba,
+        );
+        let pixels: Vec<crate::bitmap::bitmap_data::Color> = bitmap
+            .as_colors()
+            .map(crate::bitmap::bitmap_data::Color::from)
+            .collect();
+        let arc = Arc::new(pixels);
+        // Store. If a concurrent reentrant call populated in the
+        // meantime, prefer the existing entry to keep sharing
+        // maximal (single allocation across siblings).
+        let mut cache = self.pixels_cache.borrow_mut();
+        if let Some((existing, t)) = cache.as_ref() {
+            return Ok((Arc::clone(existing), *t));
+        }
+        *cache = Some((Arc::clone(&arc), transparent));
+        Ok((arc, transparent))
+    }
+
+    /// [seer-patch P1.5] Drop the cached shared pixel `Arc`. Called
+    /// from `Player::sweep_idle_bitmaps` (or future memory-pressure
+    /// code) when no `BitmapData` siblings reference the cache and
+    /// the character has been idle. Cheap to repopulate from
+    /// `compressed` on next use.
+    ///
+    /// Returns `true` if a cache entry was present.
+    pub fn evict_shared_pixels(&self) -> bool {
+        self.pixels_cache.borrow_mut().take().is_some()
     }
 }
 

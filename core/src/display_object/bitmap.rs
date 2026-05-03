@@ -198,6 +198,27 @@ impl<'gc> Bitmap<'gc> {
         Self::new_with_bitmap_data(mc, id, bitmap_data, smoothing, &movie)
     }
 
+    /// [seer-patch P1.5] Construct from a pre-shared pixel `Arc`.
+    /// Used by `library.rs::instantiate_display_object` for the
+    /// `Character::Bitmap` arm so that every `Bitmap` display object
+    /// instantiated from the same library character shares one
+    /// `Arc<Vec<Color>>` (saving N×width×height×4 bytes of CPU heap
+    /// where N = number of sibling instances).
+    pub fn new_with_shared_pixels(
+        mc: &Mutation<'gc>,
+        id: CharacterId,
+        width: u32,
+        height: u32,
+        transparency: bool,
+        pixels: std::sync::Arc<Vec<crate::bitmap::bitmap_data::Color>>,
+        movie: &Arc<SwfMovie>,
+    ) -> Self {
+        let bitmap_data =
+            BitmapData::new_with_shared_pixels(mc, width, height, transparency, pixels);
+        let smoothing = true;
+        Self::new_with_bitmap_data(mc, id, bitmap_data, smoothing, movie)
+    }
+
     // Important - we read 'width' and 'height' from the cached
     // values on this object. See the definition of these fields
     // for more information
