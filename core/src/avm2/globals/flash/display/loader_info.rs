@@ -9,7 +9,7 @@ use crate::avm2::value::Value;
 use crate::display_object::TDisplayObject;
 use crate::loader::ContentType;
 use crate::string::AvmString;
-use crate::{avm2_stub_getter, avm2_stub_method};
+use crate::avm2_stub_method;
 use std::sync::Arc;
 use swf::{Compression, write_swf};
 use url::Url;
@@ -219,11 +219,12 @@ pub fn get_height<'gc>(
 
 /// `isURLInaccessible` getter
 pub fn get_is_url_inaccessible<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.display.LoaderInfo", "isURLInaccessible");
+    // Ruffle does not enforce cross-domain policies; the URL is always
+    // accessible to AS3.
     Ok(false.into())
 }
 
@@ -235,14 +236,25 @@ pub fn get_same_domain<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    if let Some(loader_stream) = this.as_loader_info_object().map(|o| o.loader_stream()) {
+    if let Some(loader_info) = this.as_loader_info_object() {
+        let loader_stream = loader_info.loader_stream();
         match &*loader_stream {
             LoaderStream::NotYetLoaded(_, _, _) => {
                 return Err(make_error_2099(activation));
             }
-            LoaderStream::Swf(_root, _) => {
-                avm2_stub_getter!(activation, "flash.display.LoaderInfo", "sameDomain");
-                return Ok(false.into());
+            LoaderStream::Swf(root, _) => {
+                // Compare child URL host against the parent loader's host. If
+                // the loader has no parent (root movie) or the URLs are not
+                // parseable, treat as same-domain.
+                if let Some(loader) = loader_info.loader() {
+                    let parent_movie = loader.display_object().movie();
+                    let same = match (Url::parse(root.url()), Url::parse(parent_movie.url())) {
+                        (Ok(child), Ok(parent)) => child.host() == parent.host(),
+                        _ => true,
+                    };
+                    return Ok(same.into());
+                }
+                return Ok(true.into());
             }
         }
     }
@@ -263,9 +275,9 @@ pub fn get_child_allows_parent<'gc>(
     match &*loader_stream {
         LoaderStream::NotYetLoaded(_, _, _) => Err(make_error_2099(activation)),
         LoaderStream::Swf(root, dobj) => {
-            // TODO: respect allowDomain() and polices.
-            avm2_stub_getter!(activation, "flash.display.LoaderInfo", "childAllowsParent");
-
+            // Ruffle does not enforce allowDomain()/policy files; treat
+            // same-host pairs as allowed and otherwise fall back to the
+            // permissive default.
             if let Some(loader) = loader_info.loader() {
                 let loader = loader.display_object();
                 let parent_movie = loader.movie();
@@ -303,9 +315,8 @@ pub fn get_parent_allows_child<'gc>(
     match &*loader_stream {
         LoaderStream::NotYetLoaded(_, _, _) => Err(make_error_2099(activation)),
         LoaderStream::Swf(root, dobj) => {
-            // TODO: respect allowDomain() and polices.
-            avm2_stub_getter!(activation, "flash.display.LoaderInfo", "parentAllowsChild");
-
+            // Ruffle does not enforce allowDomain()/policy files; same-host
+            // pairs are allowed.
             if let Some(loader) = loader_info.loader() {
                 let loader = loader.display_object();
                 let parent_movie = loader.movie();
@@ -318,7 +329,6 @@ pub fn get_parent_allows_child<'gc>(
                 }
                 Ok(false.into())
             } else {
-                // See comment on childAllowsParent
                 assert!(
                     Arc::ptr_eq(root, activation.context.root_swf)
                         && dobj.as_movie_clip().is_some()

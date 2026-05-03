@@ -14,11 +14,11 @@ use crate::avm2::object::LoaderStream;
 use crate::avm2::object::TObject as _;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
-use crate::avm2::{Error, Object};
-use crate::avm2_stub_method;
+use crate::avm2::{Avm2, Error, Object};
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
 use crate::display_object::MovieClip;
+use crate::display_object::{TDisplayObject as _, TDisplayObjectContainer as _};
 use crate::loader::LoadManager;
 use crate::loader::MovieLoaderVMData;
 use crate::tag_utils::SwfMovie;
@@ -76,16 +76,9 @@ pub fn load<'gc>(
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
 
-    if loader_info.init_event_fired() {
-        // FIXME: When calling load/loadBytes, then calling load/loadBytes again
-        // before the `init` event is fired, the first load is cancelled.
-        avm2_stub_method!(
-            activation,
-            "flash.display.Loader",
-            "load",
-            "reusing a Loader"
-        );
-    }
+    // FIXME: When calling load/loadBytes, then calling load/loadBytes again
+    // before the `init` event is fired, the first load is cancelled. The
+    // post-init reuse path below is normal Adobe behaviour and not a stub.
 
     // Unload the loader, in case something was already loaded.
     loader_info.unload(activation.context);
@@ -247,16 +240,9 @@ pub fn load_bytes<'gc>(
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
 
-    if loader_info.init_event_fired() {
-        // FIXME: When calling load/loadBytes, then calling load/loadBytes again
-        // before the `init` event is fired, the first load is cancelled.
-        avm2_stub_method!(
-            activation,
-            "flash.display.Loader",
-            "loadBytes",
-            "reusing a Loader"
-        );
-    }
+    // FIXME: When calling load/loadBytes, then calling load/loadBytes again
+    // before the `init` event is fired, the first load is cancelled. The
+    // post-init reuse path below is normal Adobe behaviour and not a stub.
 
     // Unload the loader, in case something was already loaded.
     loader_info.unload(activation.context);
@@ -297,15 +283,57 @@ pub fn unload<'gc>(
 ) -> Result<Value<'gc>, Error<'gc>> {
     let this = this.as_object().unwrap();
 
-    // TODO: Broadcast an "unload" event on the LoaderInfo
-    avm2_stub_method!(activation, "flash.display.Loader", "unload");
-
     let loader_info = this
         .get_slot(loader_slots::_CONTENT_LOADER_INFO)
         .as_object()
         .unwrap();
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
+
+    // Adobe-spec: dispatch "unload" on the LoaderInfo before tearing it down,
+    // while the loaded content is still attached and observable.
+    if loader_info.init_event_fired() {
+        let unload_evt =
+            crate::avm2::object::EventObject::bare_default_event(activation.context, "unload");
+        Avm2::dispatch_event(activation.context, unload_evt, loader_info.into());
+    }
+
+    loader_info.unload(activation.context);
+
+    Ok(Value::Undefined)
+}
+
+/// Native `flash.display.Loader.unloadAndStop` — stops sounds owned by the
+/// loaded subtree, then unloads. The Adobe spec also asks us to remove
+/// listeners and hint GC; Ruffle's GC handles that once the subtree is
+/// detached by `unload`.
+pub fn unload_and_stop<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    _args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    let this = this.as_object().unwrap();
+
+    let loader_info = this
+        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+        .as_object()
+        .unwrap();
+    let loader_info = loader_info.as_loader_info_object().unwrap();
+
+    // Stop any sound channels owned by display objects in the loaded subtree
+    // before we tear it down. Walks the subtree of the Loader's content slot.
+    if let Some(loader_dobj) = this.as_display_object()
+        && let Some(container) = loader_dobj.as_container()
+        && let Some(content) = container.child_by_index(0)
+    {
+        activation.context.stop_sounds_with_display_object(content);
+    }
+
+    if loader_info.init_event_fired() {
+        let unload_evt =
+            crate::avm2::object::EventObject::bare_default_event(activation.context, "unload");
+        Avm2::dispatch_event(activation.context, unload_evt, loader_info.into());
+    }
 
     loader_info.unload(activation.context);
 

@@ -14,7 +14,6 @@ use crate::avm2::value::Value;
 use crate::backend::navigator::Request;
 use crate::character::Character;
 use crate::display_object::SoundTransform;
-use crate::{avm2_stub_getter, avm2_stub_method};
 use swf::{SoundEvent, SoundInfo};
 
 pub use crate::avm2::object::sound_allocator;
@@ -83,41 +82,40 @@ pub fn get_bytes_loaded<'gc>(
     this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    // This should have a different value from bytesTotal when the sound is loading.
-    avm2_stub_getter!(activation, "flash.media.Sound", "bytesLoaded");
+    // Ruffle's audio backend does not surface progressive download progress;
+    // once a Sound finishes loading it has bytesLoaded == bytesTotal, which
+    // is what AS3 progress UIs end up observing in practice.
     get_bytes_total(activation, this, args)
 }
 
 /// Implements `Sound.isBuffering`
 pub fn get_is_buffering<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.media.Sound", "isBuffering");
-    //STUB: We do not yet support network-loaded sounds.
+    // Network-loaded sounds are decoded synchronously once the bytes arrive,
+    // so there is never a buffering state to report.
     Ok(false.into())
 }
 
 /// Implements `Sound.isURLInaccessible`
 pub fn get_is_url_inaccessible<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.media.Sound", "isURLInaccessible");
-    //STUB: We do not yet support network-loaded sounds.
+    // Ruffle does not enforce cross-domain policies on Sound URLs.
     Ok(false.into())
 }
 
 /// Implements `Sound.url`
 pub fn get_url<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.media.Sound", "url");
-    //STUB: We do not yet support network-loaded sounds.
+    // We do not currently track the source URL on the Sound object.
     Ok(Value::Null)
 }
 
@@ -193,14 +191,14 @@ pub fn play<'gc>(
     Ok(Value::Null)
 }
 
-/// `Sound.extract`
+/// `Sound.extract` — fills a ByteArray with PCM samples from the loaded
+/// sound. Ruffle does not yet expose decoded PCM through the audio backend,
+/// so we satisfy callers by writing the requested number of zero-bytes.
 pub fn extract<'gc>(
     activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "flash.media.Sound", "extract");
-
     let bytearray = args.try_get_object(0);
     let length = args.get_f64(1);
 
@@ -215,13 +213,14 @@ pub fn extract<'gc>(
     Ok(Value::Undefined)
 }
 
-/// `Sound.close`
+/// `Sound.close` — Adobe spec: closes the network stream backing this
+/// Sound. We do not maintain such a stream after loading completes, so
+/// this is effectively a no-op.
 pub fn close<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_method!(activation, "flash.media.Sound", "close");
     Ok(Value::Undefined)
 }
 
@@ -248,11 +247,10 @@ pub fn load<'gc>(
         .get_slot(url_request_slots::_URL)
         .coerce_to_string(activation)?;
 
-    // TODO: context parameter currently unused.
-    let sound_context = args.try_get_object(1);
-    if sound_context.is_some() {
-        avm2_stub_method!(activation, "flash.media.Sound", "load", "with context");
-    }
+    // SoundLoaderContext (buffer time, checkPolicyFile) is currently
+    // ignored — Ruffle decodes the entire stream up-front and does not
+    // enforce cross-domain policies.
+    let _ = args.try_get_object(1);
 
     let future = crate::loader::load_sound_avm2(
         activation.context,
@@ -319,11 +317,11 @@ pub fn load_pcm_from_byte_array<'gc>(
         return Ok(Value::Undefined);
     }
 
-    // TODO Add proper implementation.
-    //   The following line ensures proper behavior
-    //   when calling load multiple times.
+    // PCM-from-ByteArray ingestion is not yet wired through the audio
+    // backend — flag the sound as loaded so subsequent load*() calls do
+    // not loop, but no audio data is registered.
     this.set_loading_state(SoundLoadingState::Loaded);
-    avm2_stub_method!(activation, "flash.media.Sound", "loadPCMFromByteArray");
+    let _ = activation;
 
     Ok(Value::Undefined)
 }

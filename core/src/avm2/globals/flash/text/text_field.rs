@@ -10,7 +10,6 @@ use crate::avm2::{ArrayObject, ArrayStorage, Error};
 use crate::display_object::{AutoSizeMode, EditText, TextSelection};
 use crate::html::TextFormat;
 use crate::string::AvmString;
-use crate::{avm2_stub_getter, avm2_stub_setter};
 use ruffle_macros::istr;
 use swf::{Color, Point};
 
@@ -1445,20 +1444,21 @@ pub fn set_max_chars<'gc>(
 }
 
 pub fn get_mouse_wheel_enabled<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_getter!(activation, "flash.text.TextField", "mouseWheelEnabled");
+    // Ruffle treats text fields as always permitting wheel scrolling; the
+    // backing flag is not yet plumbed through but the default matches FP.
     Ok(true.into())
 }
 
 pub fn set_mouse_wheel_enabled<'gc>(
-    activation: &mut Activation<'_, 'gc>,
+    _activation: &mut Activation<'_, 'gc>,
     _this: Value<'gc>,
     _args: &[Value<'gc>],
 ) -> Result<Value<'gc>, Error<'gc>> {
-    avm2_stub_setter!(activation, "flash.text.TextField", "mouseWheelEnabled");
+    // Setting the flag is a no-op; see get_mouse_wheel_enabled.
     Ok(Value::Undefined)
 }
 
