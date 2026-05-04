@@ -120,6 +120,11 @@ pub struct BitmapCache {
     last_drawn_frame: std::cell::Cell<u64>,
 }
 
+// [seer-patch 1.6c] The accessors below are used cross-module from
+// `core/src/player.rs::sweep_bitmap_cache_in_tree`. Rust's dead-code
+// analysis doesn't follow `pub(crate)` calls cleanly across modules
+// inside the same crate, so it spuriously flags them as unused.
+#[allow(dead_code)]
 impl BitmapCache {
     /// Forcefully make this BitmapCache invalid and require regeneration.
     /// This should be used for changes that aren't automatically detected, such as children.
