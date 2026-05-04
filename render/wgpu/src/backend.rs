@@ -416,7 +416,9 @@ impl<T: RenderTarget + 'static> WgpuRenderBackend<T> {
                 target: "seer_bc7",
                 "device lacks TEXTURE_COMPRESSION_BC; cannot upload BC7 bitmap"
             );
-            return Err(BitmapError::TooLarge);
+            return Err(BitmapError::Unimplemented(
+                "BC7 texture upload (device lacks TEXTURE_COMPRESSION_BC feature)".into(),
+            ));
         }
         let extent = wgpu::Extent3d {
             width: bitmap.width(),
