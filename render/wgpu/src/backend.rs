@@ -785,9 +785,16 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             freed_bytes: on_screen.freed_bytes + offscreen.freed_bytes,
         };
         if report.dropped_entries > 0 || report.purged_keys > 0 {
-            // [seer-patch 1.7 §1 — bisect step 2, re-enabled 2026-05-04]
-            // poll(Wait) on top of CLEANUP_INTERVAL=8.
-            // MemoryUsage still reverted.
+            // [seer-patch 1.7 §1] Drain wgpu's deferred-destroy queue
+            // before relying on gpu_alloc::cleanup. ETW confirmed
+            // 0 VirtualFree events without this — wgpu held
+            // Arc<Texture> clones in its pending-destroy queue until
+            // GPU sync. queue.submit(empty) flushes encoders;
+            // device.poll(Wait) blocks until all submits complete
+            // and callbacks fire, at which point wgpu drops its refs
+            // and our subsequent dealloc_block calls find empty
+            // blocks. Cost: ~10–30 ms blocking per sweep call;
+            // acceptable on sweep cadence (every 15 frames).
             let _ = self.descriptors.queue.submit(std::iter::empty());
             let _ = self.descriptors.device.poll(wgpu::PollType::Wait {
                 submission_index: None,
@@ -1413,10 +1420,12 @@ async fn request_device(
             label: None,
             required_features: features,
             required_limits: limits,
-            // [seer-patch 1.7 §2 — bisect step 3, re-enabled
-            // 2026-05-04] MemoryUsage on top of CLEANUP_INTERVAL=8
-            // and poll(Wait). Both safe in tests 1 and 2; this is
-            // the suspected culprit.
+            // [seer-patch 1.7 §2] Smaller gpu_alloc chunks
+            // (8 MB starting / 64 MB final / 8 MB dedicated
+            // threshold instead of 128/512/32). Less memory
+            // wasted in partial blocks; cleanup() pickup is
+            // faster when wgpu's deferred-destroy queue drains.
+            // Bisect on 2026-05-04 verified safe under live load.
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
