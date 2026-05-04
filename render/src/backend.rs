@@ -25,6 +25,17 @@ pub struct BitmapCacheEntry {
     pub filters: Vec<Filter>,
 }
 
+/// [seer-patch 1.6b] Plain (non-wgpu-typed) sweep report so the
+/// trait method can stay backend-agnostic. Mirrors
+/// `ruffle_render_wgpu::buffer_pool::TexturePoolSweepReport`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TexturePoolSweepReportPlain {
+    pub keys_swept: usize,
+    pub dropped_entries: usize,
+    pub purged_keys: usize,
+    pub freed_bytes: u64,
+}
+
 pub trait RenderBackend: Any {
     fn viewport_dimensions(&self) -> ViewportDimensions;
     // Do not call this method directly - use `player.set_viewport_dimensions`,
@@ -93,6 +104,27 @@ pub trait RenderBackend: Any {
     /// Default: no-op (preserves upstream behaviour for non-wgpu
     /// backends and any backend that doesn't queue frees).
     fn empty_submit(&mut self) {}
+
+    /// [seer-patch 1.6b] Sweep the renderer's `TexturePool` (filter
+    /// intermediates + surface render targets). Returns
+    /// `(keys_swept, dropped_entries, purged_keys, freed_bytes)`.
+    ///
+    /// `policy` carries `(max_per_pool, idle_frames, purge_frames)`.
+    ///
+    /// Default: returns all-zeros (backend has no pool to sweep).
+    fn sweep_texture_pools(
+        &mut self,
+        _max_per_pool: usize,
+        _idle_frames: u64,
+        _purge_frames: u64,
+    ) -> TexturePoolSweepReportPlain {
+        TexturePoolSweepReportPlain::default()
+    }
+
+    /// [seer-patch 1.6b] Bump the renderer's frame counter (used by
+    /// `TexturePool::sweep` to age pool entries).
+    /// Default: no-op.
+    fn bump_frame_counter(&mut self) {}
 
     fn create_empty_texture(
         &mut self,

@@ -659,6 +659,47 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let _ = self.descriptors.queue.submit(std::iter::empty());
     }
 
+    /// [seer-patch 1.6b] Sweep both the on-screen and offscreen
+    /// `TexturePool`s. The on-screen pool holds filter intermediates
+    /// and main-stage render targets; the offscreen pool holds
+    /// targets used by `BitmapData.draw` paths. Each is bounded by
+    /// the same policy.
+    fn sweep_texture_pools(
+        &mut self,
+        max_per_pool: usize,
+        idle_frames: u64,
+        purge_frames: u64,
+    ) -> ruffle_render::backend::TexturePoolSweepReportPlain {
+        let policy = crate::buffer_pool::TexturePoolSweepPolicy {
+            max_per_pool,
+            idle_frames,
+            purge_frames,
+        };
+        let frame = crate::buffer_pool::current_frame_counter();
+        let on_screen = self.texture_pool.sweep(frame, policy);
+        let offscreen = self.offscreen_texture_pool.sweep(frame, policy);
+        let report = ruffle_render::backend::TexturePoolSweepReportPlain {
+            keys_swept: on_screen.keys_swept + offscreen.keys_swept,
+            dropped_entries: on_screen.dropped_entries + offscreen.dropped_entries,
+            purged_keys: on_screen.purged_keys + offscreen.purged_keys,
+            freed_bytes: on_screen.freed_bytes + offscreen.freed_bytes,
+        };
+        if report.dropped_entries > 0 || report.purged_keys > 0 {
+            // Same caveat as `empty_submit`: drain the wgpu pending-
+            // free list so dropped pool textures release their
+            // gpu-allocator blocks promptly.
+            let _ = self.descriptors.queue.submit(std::iter::empty());
+        }
+        report
+    }
+
+    /// [seer-patch 1.6b] Tick the global frame counter used by
+    /// `TexturePool::sweep`. Called once per frame from the seer
+    /// launcher's `FlashPlayer::tick`.
+    fn bump_frame_counter(&mut self) {
+        crate::buffer_pool::bump_frame_counter();
+    }
+
     #[instrument(level = "debug", skip_all)]
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
         let mut bitmap = bitmap.to_rgba();
@@ -717,6 +758,7 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         let bitmap_bytes = (extent.width as u64) * (extent.height as u64) * 4;
         if let Some(host) = crate::seer::host() {
             host.on_bitmap_registered(extent.width, extent.height, bitmap_bytes);
+            host.on_texture_registered(crate::seer::TextureSource::Bitmap, bitmap_bytes);
         }
 
         let handle = BitmapHandle(Arc::new(Texture {
@@ -725,6 +767,8 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
             bitmap_bytes,
+            census_source: crate::seer::TextureSource::Bitmap,
+            census_bytes: bitmap_bytes,
         }));
 
         Ok(handle)
@@ -988,12 +1032,23 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                             | wgpu::TextureUsages::RENDER_ATTACHMENT
                             | wgpu::TextureUsages::COPY_SRC,
                     });
+                let pb_bytes = (extent.width as u64)
+                    * (extent.height as u64)
+                    * (texture_format.block_copy_size(None).unwrap_or(4) as u64);
+                if let Some(host) = crate::seer::host() {
+                    host.on_texture_registered(
+                        crate::seer::TextureSource::PixelBender,
+                        pb_bytes,
+                    );
+                }
                 BitmapHandle(Arc::new(Texture {
                     texture,
                     bind_linear: Default::default(),
                     bind_nearest: Default::default(),
                     copy_count: Cell::new(0),
                     bitmap_bytes: 0, // [seer-patch] not a bitmap registration
+                    census_source: crate::seer::TextureSource::PixelBender,
+                    census_bytes: pb_bytes,
                 }))
             }
         };
@@ -1146,12 +1201,26 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
                     | wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC,
             });
+        // [seer-patch 1.6a] cacheAsBitmap render targets pour the
+        // bulk of GPU memory at login (vmmap shows 46 × 32 MB
+        // textures uniform-shape, characteristic of these). Tag them
+        // so `TextureCensus.cache_mb` exposes the load. Phase 1.6c
+        // adds idle-eviction.
+        let cache_bytes = (width as u64) * (height as u64) * 4;
+        if let Some(host) = crate::seer::host() {
+            host.on_texture_registered(
+                crate::seer::TextureSource::BitmapCache,
+                cache_bytes,
+            );
+        }
         Ok(BitmapHandle(Arc::new(Texture {
             texture,
             bind_linear: Default::default(),
             bind_nearest: Default::default(),
             copy_count: Cell::new(0),
             bitmap_bytes: 0, // [seer-patch] not a bitmap registration
+            census_source: crate::seer::TextureSource::BitmapCache,
+            census_bytes: cache_bytes,
         })))
     }
 

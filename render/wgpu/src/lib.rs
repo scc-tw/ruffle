@@ -263,6 +263,19 @@ pub struct Texture {
     /// `register_bitmap` (render targets, atlas pages, …) — those
     /// don't participate in the bitmap-cache pressure tally.
     pub(crate) bitmap_bytes: u64,
+    /// [seer-patch 1.6a] Per-source attribution for the new
+    /// `TextureCensus`. Always set (every wrapper has a source);
+    /// for `register_bitmap` path equals `Bitmap` and `census_bytes`
+    /// matches `bitmap_bytes`. For `create_empty_texture`,
+    /// pixel_bender output bytes, and Context3D buffers each
+    /// construction site sets the appropriate variant.
+    pub(crate) census_source: crate::seer::TextureSource,
+    /// [seer-patch 1.6a] Bytes counted into the `TextureCensus` gauge
+    /// for `census_source`. Equals `bitmap_bytes` when source ==
+    /// Bitmap, otherwise the GPU footprint of the texture
+    /// (`width * height * bytes_per_pixel`). Set on construction;
+    /// decremented on Drop.
+    pub(crate) census_bytes: u64,
 }
 
 // [seer-patch] Texture Drop balances the cumulative-bytes census kept
@@ -272,12 +285,18 @@ pub struct Texture {
 // VkDeviceMemory is released asynchronously by wgpu when the GPU
 // finishes any in-flight work, so the host's gauge tracks "in-flight
 // + alive" rather than "currently mapped to GPU memory".
+//
+// [seer-patch 1.6a] Also fires the per-source `on_texture_dropped`
+// hook so `TextureCensus` can reconcile per-source gauges.
 impl Drop for Texture {
     fn drop(&mut self) {
-        if self.bitmap_bytes > 0
-            && let Some(host) = crate::seer::host()
-        {
-            host.on_bitmap_dropped(self.bitmap_bytes);
+        if let Some(host) = crate::seer::host() {
+            if self.bitmap_bytes > 0 {
+                host.on_bitmap_dropped(self.bitmap_bytes);
+            }
+            if self.census_bytes > 0 {
+                host.on_texture_dropped(self.census_source, self.census_bytes);
+            }
         }
     }
 }

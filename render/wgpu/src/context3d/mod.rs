@@ -110,12 +110,19 @@ impl WgpuContext3D {
                 usage: wgpu::TextureUsages::COPY_SRC,
             });
 
+            // [seer-patch 1.6a] dummy 1×1 — tiny, but still tagged so
+            // census reconciles. 4 bytes (1×1 RGBA8).
+            if let Some(host) = crate::seer::host() {
+                host.on_texture_registered(crate::seer::TextureSource::Context3D, 4);
+            }
             BitmapHandle(Arc::new(Texture {
                 bind_linear: Default::default(),
                 bind_nearest: Default::default(),
                 texture: dummy_texture,
                 copy_count: Cell::new(0),
                 bitmap_bytes: 0, // [seer-patch] context3d, not a bitmap reg
+                census_source: crate::seer::TextureSource::Context3D,
+                census_bytes: 4,
             }))
         };
 
@@ -633,6 +640,13 @@ impl Context3D for WgpuContext3D {
                     .as_ref()
                     .map(|t| t.create_view(&Default::default()));
 
+                // [seer-patch 1.6a] Stage3D back/front buffer bytes.
+                // Format size in bytes per pixel (RGBA8 = 4, BGRA = 4, etc).
+                // Use block_copy_size which returns bytes per block; for
+                // uncompressed formats that's bytes per pixel.
+                let ctx3d_bytes = (width as u64)
+                    * (height as u64)
+                    * (format.block_copy_size(None).unwrap_or(4) as u64);
                 if sample_count > 1 {
                     self.current_texture_resolve_view = Some(
                         back_buffer_resolve_texture
@@ -644,12 +658,24 @@ impl Context3D for WgpuContext3D {
                     // We always use a non-multisampled texture as our raw texture handle,
                     // which is what the Stage rendering code expects. In multisample mode,
                     // this is our resolve texture.
+                    if let Some(host) = crate::seer::host() {
+                        host.on_texture_registered(
+                            crate::seer::TextureSource::Context3D,
+                            ctx3d_bytes,
+                        );
+                        host.on_texture_registered(
+                            crate::seer::TextureSource::Context3D,
+                            ctx3d_bytes,
+                        );
+                    }
                     self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: back_buffer_resolve_texture.unwrap(),
                         bind_linear: Default::default(),
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
                         bitmap_bytes: 0, // [seer-patch] context3d
+                        census_source: crate::seer::TextureSource::Context3D,
+                        census_bytes: ctx3d_bytes,
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: front_buffer_resolve_texture.unwrap(),
@@ -657,17 +683,31 @@ impl Context3D for WgpuContext3D {
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
                         bitmap_bytes: 0, // [seer-patch] context3d
+                        census_source: crate::seer::TextureSource::Context3D,
+                        census_bytes: ctx3d_bytes,
                     }));
                 } else {
                     // In non-multisample mode, we don't have a separate resolve buffer,
                     // so our main texture gets used as the raw texture handle.
 
+                    if let Some(host) = crate::seer::host() {
+                        host.on_texture_registered(
+                            crate::seer::TextureSource::Context3D,
+                            ctx3d_bytes,
+                        );
+                        host.on_texture_registered(
+                            crate::seer::TextureSource::Context3D,
+                            ctx3d_bytes,
+                        );
+                    }
                     self.back_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: back_buffer_texture,
                         bind_linear: Default::default(),
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
                         bitmap_bytes: 0, // [seer-patch] context3d
+                        census_source: crate::seer::TextureSource::Context3D,
+                        census_bytes: ctx3d_bytes,
                     }));
                     self.front_buffer_raw_texture_handle = BitmapHandle(Arc::new(Texture {
                         texture: front_buffer_texture,
@@ -675,6 +715,8 @@ impl Context3D for WgpuContext3D {
                         bind_nearest: Default::default(),
                         copy_count: Cell::new(0),
                         bitmap_bytes: 0, // [seer-patch] context3d
+                        census_source: crate::seer::TextureSource::Context3D,
+                        census_bytes: ctx3d_bytes,
                     }));
                     self.current_texture_resolve_view = None;
                 }

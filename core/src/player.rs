@@ -2300,6 +2300,73 @@ impl Player {
         Some(report)
     }
 
+    /// [seer-patch 1.6b] Sweep the wgpu `TexturePool` (filter
+    /// intermediates + surface render targets). Bumps the global
+    /// frame counter exactly once per call (the renderer's pool
+    /// uses it to age idle entries).
+    ///
+    /// Returns `None` when no `texture_pool_policy` is installed.
+    pub fn sweep_texture_pools(
+        &mut self,
+    ) -> Option<crate::seer::TexturePoolSweepReport> {
+        let host = crate::seer::host()?;
+        let policy = host.texture_pool_policy()?;
+        // Bump first so this frame's draws (just before sweep) are
+        // visible as `frame == frame_at_sweep` (idle = 0). Sweep
+        // policy compares against this value.
+        crate::seer::bump_frame_counter();
+        self.renderer.bump_frame_counter();
+        let plain = self.renderer.sweep_texture_pools(
+            policy.max_per_pool,
+            policy.idle_frames,
+            policy.purge_frames,
+        );
+        Some(crate::seer::TexturePoolSweepReport {
+            keys_swept: plain.keys_swept,
+            dropped_entries: plain.dropped_entries,
+            purged_keys: plain.purged_keys,
+            freed_bytes: plain.freed_bytes,
+        })
+    }
+
+    /// [seer-patch 1.6c] Sweep `BitmapCache` (cacheAsBitmap render
+    /// targets). Walks the display tree (render_list ∪ depth_list ∪
+    /// orphans, parallel to `sweep_idle_bitmaps`) and drops
+    /// `BitmapInfo` from caches not drawn for `policy.idle_frames`.
+    ///
+    /// Re-render on next visible frame regenerates the cache via
+    /// the existing dirty path; one-frame cost.
+    pub fn sweep_idle_bitmap_caches(
+        &mut self,
+    ) -> Option<crate::seer::BitmapCacheSweepReport> {
+        let host = crate::seer::host()?;
+        let policy = host.bitmap_cache_policy()?;
+        let current = crate::seer::current_frame_counter();
+        let mut report = crate::seer::BitmapCacheSweepReport::default();
+        self.enter_arena_mut(|gc_context, gc_root, _| {
+            sweep_bitmap_cache_in_tree(
+                gc_context,
+                gc_root.stage.into(),
+                current,
+                &policy,
+                &mut report,
+            );
+            for orphan in gc_root.orphan_manager.iter_live(gc_context) {
+                sweep_bitmap_cache_in_tree(
+                    gc_context,
+                    orphan,
+                    current,
+                    &policy,
+                    &mut report,
+                );
+            }
+        });
+        if report.evicted > 0 {
+            self.renderer.empty_submit();
+        }
+        Some(report)
+    }
+
     /// The current frame of the main timeline, if available.
     /// The first frame is frame 1.
     pub fn current_frame(&self) -> Option<u16> {
@@ -3476,6 +3543,61 @@ fn sweep_bitmap_data_in_tree<'gc>(
         let children = container.raw_container().collect_depth_and_render_children();
         for child in children {
             sweep_bitmap_data_in_tree(mc, child, now, policy, report);
+        }
+    }
+}
+
+/// [seer-patch 1.6c] Walk the display tree, dropping `BitmapInfo`
+/// from `BitmapCache` slots whose `last_drawn_frame` is older than
+/// `policy.idle_frames`. Caches under `min_bytes_to_evict` are
+/// kept (cheap to retain). Re-render of the owning DO on a later
+/// frame triggers `cache.is_dirty()` true → fresh `update()`.
+fn sweep_bitmap_cache_in_tree<'gc>(
+    mc: &gc_arena::Mutation<'gc>,
+    node: crate::display_object::DisplayObject<'gc>,
+    current_frame: u64,
+    policy: &crate::seer::BitmapCachePolicy,
+    report: &mut crate::seer::BitmapCacheSweepReport,
+) {
+    use crate::display_object::TDisplayObject;
+
+    {
+        // BitmapCache lives on every DisplayObjectBase, accessed via
+        // `bitmap_cache_mut` (RefMut into the inner cell). Scope the
+        // borrow tightly so children traversal can re-borrow.
+        // `node.base()` returns by value (it's a Gc deref); bind it
+        // to a local so the RefMut from `bitmap_cache_mut()` doesn't
+        // dangle on a temporary.
+        let base = node.base();
+        let mut cache_slot = base.bitmap_cache_mut();
+        if let Some(cache) = &mut *cache_slot {
+            if cache.is_realised() {
+                report.total_realised += 1;
+                let bytes = cache.realised_bytes();
+                if bytes < policy.min_bytes_to_evict {
+                    report.kept += 1;
+                } else {
+                    let last = cache.last_drawn();
+                    let idle = current_frame.saturating_sub(last);
+                    if idle < policy.idle_frames {
+                        report.kept += 1;
+                    } else {
+                        let freed = cache.evict_handle();
+                        report.evicted += 1;
+                        report.freed_bytes = report.freed_bytes.saturating_add(freed);
+                    }
+                }
+            }
+        }
+    }
+
+    // Walk both render_list and depth_list children, plus skip
+    // through container nodes the same way `sweep_bitmap_data_in_tree`
+    // does. AVM2 orphans are walked separately by the caller.
+    if let Some(container) = node.as_container() {
+        let children = container.raw_container().collect_depth_and_render_children();
+        for child in children {
+            sweep_bitmap_cache_in_tree(mc, child, current_frame, policy, report);
         }
     }
 }

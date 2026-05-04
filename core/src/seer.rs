@@ -22,7 +22,30 @@
 //! call sites are byte-identical to upstream Ruffle.
 
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// [seer-patch 1.6b/c] Process-global monotonic frame counter used
+/// by both `TexturePool` sweep (filter intermediates) and
+/// `BitmapCache` sweep (cacheAsBitmap render targets) to age idle
+/// entries.
+///
+/// Bumped from `Player::sweep_texture_pools` (which the seer
+/// launcher calls once per frame). Reading is `Relaxed` — these
+/// counters are advisory; race-free monotonic.
+static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// [seer-patch 1.6b/c] Bump the global frame counter and return the
+/// new value. Called once per frame from the launcher's sweep loop.
+pub fn bump_frame_counter() -> u64 {
+    FRAME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// [seer-patch 1.6b/c] Read the current frame counter without
+/// bumping. Used by `BitmapCache::bump_last_drawn` (render path).
+pub fn current_frame_counter() -> u64 {
+    FRAME_COUNTER.load(Ordering::Relaxed)
+}
 
 /// Stats returned by `Player::sweep_idle_libraries`. Hosts use
 /// these to format a `[swf-sweep]` log line and update memory-
@@ -136,6 +159,92 @@ impl Default for BitmapResidencyPolicy {
             decode_strategy: BitmapDecodeStrategy::default(),
         }
     }
+}
+
+/// [seer-patch 1.6b] Tunables for the `TexturePool` (filter
+/// intermediate / surface render-target) sweep. When `Some` is
+/// returned from [`CoreSeerHost::texture_pool_policy`],
+/// `Player::sweep_texture_pools` will cap each per-key pool, drop
+/// idle entries, and purge whole-pool entries.
+///
+/// `None` (default) preserves upstream behaviour (unbounded pool).
+#[derive(Debug, Clone, Copy)]
+pub struct TexturePoolPolicy {
+    /// Cap each per-key pool at this many entries. Most keys see
+    /// at most ~4 simultaneous in-flight items (filter ping-pong +
+    /// read + write). Default 4.
+    pub max_per_pool: usize,
+    /// Drop pool items not returned for this many frames. Default
+    /// 60 (~1 s at 60 fps).
+    pub idle_frames: u64,
+    /// Drop the entire keyed pool if no `take()` for this many
+    /// frames. Default 600 (~10 s).
+    pub purge_frames: u64,
+}
+
+impl Default for TexturePoolPolicy {
+    fn default() -> Self {
+        Self {
+            max_per_pool: 4,
+            idle_frames: 60,
+            purge_frames: 600,
+        }
+    }
+}
+
+/// [seer-patch 1.6b] Stats returned by `Player::sweep_texture_pools`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TexturePoolSweepReport {
+    /// Per-key pools that had at least one entry dropped.
+    pub keys_swept: usize,
+    /// Total pool items dropped (across all keys).
+    pub dropped_entries: usize,
+    /// Per-key pools removed entirely (long-idle).
+    pub purged_keys: usize,
+    /// Estimated bytes freed.
+    pub freed_bytes: u64,
+}
+
+/// [seer-patch 1.6c] Tunables for the `BitmapCache` (cacheAsBitmap
+/// render target) sweep. When `Some` is returned from
+/// [`CoreSeerHost::bitmap_cache_policy`], `Player::sweep_idle_bitmap_caches`
+/// drops `BitmapInfo` from caches that haven't been drawn for K
+/// frames. Re-render on next visible frame regenerates the cache.
+///
+/// `None` (default) preserves upstream behaviour (cache lives until
+/// display object drops or size changes).
+#[derive(Debug, Clone, Copy)]
+pub struct BitmapCachePolicy {
+    /// Drop the cache if not drawn for this many frames. Default 300
+    /// (~5 s at 60 fps). Cache is much cheaper to recreate than a
+    /// JPEG-decoded library bitmap, so we can be more aggressive.
+    pub idle_frames: u64,
+    /// Skip eviction for caches smaller than this; cheap to keep.
+    /// Default 256 KB.
+    pub min_bytes_to_evict: u64,
+}
+
+impl Default for BitmapCachePolicy {
+    fn default() -> Self {
+        Self {
+            idle_frames: 300,
+            min_bytes_to_evict: 256 * 1024,
+        }
+    }
+}
+
+/// [seer-patch 1.6c] Stats returned by `Player::sweep_idle_bitmap_caches`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BitmapCacheSweepReport {
+    /// Number of `BitmapCache::bitmap` slots cleared.
+    pub evicted: usize,
+    /// Estimated bytes freed (sum of `width × height × 4`).
+    pub freed_bytes: u64,
+    /// Number of caches kept (recently drawn or below
+    /// `min_bytes_to_evict`).
+    pub kept: usize,
+    /// Total caches with realised bitmaps inspected this sweep.
+    pub total_realised: usize,
 }
 
 /// [seer-patch P1] Stats returned by `Player::sweep_idle_bitmaps`.
@@ -340,6 +449,26 @@ pub trait CoreSeerHost: Send + Sync + 'static {
         &self,
         _backend: &mut dyn ruffle_render::backend::RenderBackend,
     ) -> Option<ruffle_render::bitmap::BitmapHandle> {
+        None
+    }
+
+    /// [seer-patch 1.6b] If `Some`, enables `Player::sweep_texture_pools`
+    /// to bound the wgpu `TexturePool` (filter intermediate + render
+    /// target pool) so peak concurrent demand doesn't get permanently
+    /// retained.
+    ///
+    /// Default: `None` (no sweep, upstream behaviour).
+    fn texture_pool_policy(&self) -> Option<TexturePoolPolicy> {
+        None
+    }
+
+    /// [seer-patch 1.6c] If `Some`, enables `Player::sweep_idle_bitmap_caches`
+    /// to drop `BitmapCache` (cacheAsBitmap render targets) that
+    /// haven't been drawn in `idle_frames`. Re-render on next visible
+    /// frame regenerates the cache transparently.
+    ///
+    /// Default: `None` (no sweep, upstream behaviour).
+    fn bitmap_cache_policy(&self) -> Option<BitmapCachePolicy> {
         None
     }
 }

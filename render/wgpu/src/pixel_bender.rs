@@ -482,12 +482,24 @@ pub(super) fn run_pixelbender_shader_impl(
                             extent,
                         );
 
+                        // [seer-patch 1.6a] pixel bender intermediate clone.
+                        let pb_bytes = (extent.width as u64)
+                            * (extent.height as u64)
+                            * 4;
+                        if let Some(host) = crate::seer::host() {
+                            host.on_texture_registered(
+                                crate::seer::TextureSource::PixelBender,
+                                pb_bytes,
+                            );
+                        }
                         BitmapHandle(Arc::new(Texture {
                             texture: fresh_texture,
                             bind_linear: Default::default(),
                             bind_nearest: Default::default(),
                             copy_count: Cell::new(0),
                             bitmap_bytes: 0, // [seer-patch] pixel_bender
+                            census_source: crate::seer::TextureSource::PixelBender,
+                            census_bytes: pb_bytes,
                         }))
                     });
                     *texture = Some(cached_fresh_handle.clone().into());

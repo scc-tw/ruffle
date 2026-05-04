@@ -37,6 +37,71 @@
 
 use std::sync::{Arc, OnceLock};
 
+/// [seer-patch 1.6a] Origin of a `wgpu::Texture` allocation, surfaced
+/// to the host so per-source memory gauges can isolate where GPU
+/// memory pressure originates.
+///
+/// Phase 1's `BitmapCensus` only tracked the `Bitmap` source
+/// (= `register_bitmap`). Live measurement (vmmap 2026-05-04) showed
+/// the bulk of GPU memory was in `BitmapCache` render targets +
+/// `FilterPool` intermediates instead — both invisible to
+/// `BitmapCensus`. Phase 1.6a adds this source tag so the host can
+/// attribute every `wgpu::Texture` to one of the buckets below.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TextureSource {
+    /// `WgpuRenderBackend::register_bitmap` — library bitmaps
+    /// (`DefineBits`, `BitmapData::new_with_pixels`). Tracked also
+    /// by the legacy `BitmapCensus` gauge for back-compat.
+    Bitmap,
+    /// `WgpuRenderBackend::create_empty_texture` — render targets
+    /// for `displayObject.cacheAsBitmap = true` (or implicit caching
+    /// via filters). Phase 1.6c targets these for idle-eviction.
+    BitmapCache,
+    /// `TexturePool::get_texture` — filter intermediates (blur, glow,
+    /// drop shadow) and surface render targets. Phase 1.6b targets
+    /// these for LRU cap + idle-purge.
+    FilterPool,
+    /// `Context3D::create_texture` — Stage3D back/front buffers and
+    /// dynamic Context3D textures. Confirmed unused by 賽爾號 in
+    /// Phase 1.6d audit, but tagged so we'd notice if a future SWF
+    /// starts using Stage3D.
+    Context3D,
+    /// Pixel bender intermediate textures (`pixel_bender.rs`).
+    /// Confirmed unused by 賽爾號; tagged for visibility.
+    PixelBender,
+    /// Mesh-attached textures, surface backbuffers, and any other
+    /// site that doesn't fit the categories above. Small footprint;
+    /// included for census reconciliation.
+    Other,
+}
+
+impl TextureSource {
+    /// Stable index into a fixed-size gauge array. Keep in sync with
+    /// `TextureCensus::SOURCE_COUNT` on the host side.
+    pub fn index(self) -> usize {
+        match self {
+            TextureSource::Bitmap => 0,
+            TextureSource::BitmapCache => 1,
+            TextureSource::FilterPool => 2,
+            TextureSource::Context3D => 3,
+            TextureSource::PixelBender => 4,
+            TextureSource::Other => 5,
+        }
+    }
+
+    /// Short tag for log lines / debug labels.
+    pub fn short(self) -> &'static str {
+        match self {
+            TextureSource::Bitmap => "bitmap",
+            TextureSource::BitmapCache => "cache",
+            TextureSource::FilterPool => "pool",
+            TextureSource::Context3D => "ctx3d",
+            TextureSource::PixelBender => "pb",
+            TextureSource::Other => "other",
+        }
+    }
+}
+
 /// Host-side seer context. Implementors decide how the seer launcher
 /// wants the wgpu backend to deviate from upstream Ruffle.
 ///
@@ -89,6 +154,25 @@ pub trait SeerHost: Send + Sync + 'static {
     ///
     /// Default: no-op.
     fn on_bitmap_dropped(&self, _bytes: u64) {}
+
+    /// [seer-patch 1.6a] Notification that a `wgpu::Texture` was
+    /// allocated with the given source attribution. Fires once per
+    /// `Texture` wrapper construction (and once per `TexturePool`
+    /// constructor invocation).
+    ///
+    /// `Bitmap`-source registrations *also* fire `on_bitmap_registered`
+    /// (the two hooks coexist for back-compat); other sources fire
+    /// only this hook.
+    ///
+    /// Default: no-op.
+    fn on_texture_registered(&self, _source: TextureSource, _bytes: u64) {}
+
+    /// [seer-patch 1.6a] Notification that a `wgpu::Texture` is
+    /// being dropped. Pair with `on_texture_registered` to maintain
+    /// per-source live byte gauges.
+    ///
+    /// Default: no-op.
+    fn on_texture_dropped(&self, _source: TextureSource, _bytes: u64) {}
 }
 
 /// A trivial host that returns every upstream default. Useful as a

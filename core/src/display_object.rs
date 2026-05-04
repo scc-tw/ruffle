@@ -111,6 +111,13 @@ pub struct BitmapCache {
 
     /// Whether we warned that this bitmap was too large to be cached
     warned_for_oversize: bool,
+
+    /// [seer-patch 1.6c] Frame stamp of the most recent
+    /// `cache.handle()` call from the render path. Bumped from
+    /// `display_object::render_base` whenever this cache produces a
+    /// `DrawCacheInfo`. Used by `Player::sweep_idle_bitmap_caches` to
+    /// drop `bitmap` when not drawn for `idle_frames`.
+    last_drawn_frame: std::cell::Cell<u64>,
 }
 
 impl BitmapCache {
@@ -190,6 +197,47 @@ impl BitmapCache {
 
     fn handle(&self) -> Option<BitmapHandle> {
         self.bitmap.as_ref().map(|b| b.handle.clone())
+    }
+
+    /// [seer-patch 1.6c] Bump the last-drawn frame stamp. Called from
+    /// `render_base` whenever this cache produces a `DrawCacheInfo`,
+    /// regardless of whether the cache was dirty (re-rendered) or
+    /// reused from the previous frame. Drives sweep idle decisions.
+    pub fn bump_last_drawn(&self, frame: u64) {
+        self.last_drawn_frame.set(frame);
+    }
+
+    /// [seer-patch 1.6c] Read the last-drawn frame stamp. `0` is the
+    /// initial value (not yet drawn).
+    pub fn last_drawn(&self) -> u64 {
+        self.last_drawn_frame.get()
+    }
+
+    /// [seer-patch 1.6c] Drop the cached `BitmapInfo`. Returns the
+    /// number of bytes that were realised (0 if cache was empty).
+    /// Next render of this object will see `is_dirty() == true` and
+    /// trigger a fresh `update()` → `create_empty_texture()`.
+    pub fn evict_handle(&mut self) -> u64 {
+        if let Some(info) = self.bitmap.take() {
+            (info.width as u64) * (info.height as u64) * 4
+        } else {
+            0
+        }
+    }
+
+    /// [seer-patch 1.6c] Whether the cache currently holds a
+    /// realised `BitmapInfo` (and is therefore eligible for sweep).
+    pub fn is_realised(&self) -> bool {
+        self.bitmap.is_some()
+    }
+
+    /// [seer-patch 1.6c] Estimated GPU bytes of the realised cache
+    /// (`width × height × 4`). 0 if not realised.
+    pub fn realised_bytes(&self) -> u64 {
+        self.bitmap
+            .as_ref()
+            .map(|info| (info.width as u64) * (info.height as u64) * 4)
+            .unwrap_or(0)
     }
 }
 
@@ -815,7 +863,7 @@ impl<'gc> DisplayObjectBase<'gc> {
         self.recheck_cache_as_bitmap();
     }
 
-    fn bitmap_cache_mut(&self) -> RefMut<'_, Option<BitmapCache>> {
+    pub(crate) fn bitmap_cache_mut(&self) -> RefMut<'_, Option<BitmapCache>> {
         RefMut::map(self.cell.borrow_mut(), |c| &mut c.cache)
     }
 
@@ -991,6 +1039,10 @@ pub fn render_base<'gc>(
                     y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                 };
                 let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
+                // [seer-patch 1.6c] Stamp the draw frame so sweep can
+                // tell idle from active caches. Bumped in BOTH the
+                // dirty (cache regenerated) and clean (reused) paths.
+                cache.bump_last_drawn(crate::seer::current_frame_counter());
                 if cache.is_dirty(&base_transform.matrix, width, height) {
                     cache.update(
                         context.renderer,
