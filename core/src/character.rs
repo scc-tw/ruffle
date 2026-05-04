@@ -145,13 +145,12 @@ impl<'gc> BitmapCharacter<'gc> {
             (r.pending_decode_id, r.was_realised)
         };
 
-        // [seer-patch Phase 2 — bisect step 4 confirmed 2026-05-04]
-        // BC7 cache lookup is THE cause of the visual regression
-        // ("background not showing" / "hang"). Disabled until root-
-        // caused. The tightening trio (CLEANUP_INTERVAL=8 + poll(Wait)
-        // + MemoryUsage) is innocent, kept enabled.
-        if false
-            && let Some(host) = crate::seer::host()
+        // [seer-patch Phase 2] BC7 disk-cache fast path. If the host
+        // has a BC7 payload for this character's compressed source
+        // bytes, upload it as a Bc7RgbaUnorm texture (4× smaller
+        // than RGBA8, no JPEG decode). Cache miss falls through to
+        // the existing JPEG-decode path.
+        if let Some(host) = crate::seer::host()
             && let Some(payload) =
                 host.bc7_cache_lookup(self.compressed.key_bytes())
         {
@@ -268,16 +267,37 @@ impl<'gc> BitmapCharacter<'gc> {
         // - no host installed,
         // - host couldn't supply a placeholder.
         let decoded = self.compressed.decode()?;
-        // [seer-patch Phase 2 — capture-and-submit DISABLED 2026-05-04]
-        // The cold-path capture (clone bitmap, take rgba bytes, submit
-        // encode) was causing visual regression in the live launcher
-        // ("background not showing"). Reverted as a kill-switch.
-        // BC7 cache lookup (above) still works for any pre-existing
-        // hits but the cache won't grow on miss. With the lookup
-        // path also returning all-misses on v1 files, BC7 is
-        // effectively dormant until the cause of the regression is
-        // root-caused.
+
+        // [seer-patch Phase 2 — capture-and-submit RE-ENABLED 2026-05-04]
+        // The encoder bug (BlockCompressorBC7 reusing best_err across
+        // blocks) is fixed; new encodes should be correct. Capture
+        // RGBA bytes + cache key BEFORE register_bitmap consumes the
+        // bitmap; submit encode AFTER successful upload.
+        let bc7_encode_inputs = {
+            let s = self.compressed.size();
+            if s.width % 4 == 0
+                && s.height % 4 == 0
+                && crate::seer::host().is_some()
+            {
+                let bm = decoded.clone().to_rgba();
+                Some((
+                    std::sync::Arc::<[u8]>::from(self.compressed.key_bytes()),
+                    bm.data().to_vec(),
+                    s.width,
+                    s.height,
+                ))
+            } else {
+                None
+            }
+        };
+
         let new_handle = backend.register_bitmap(decoded)?;
+
+        if let Some((key_bytes, rgba, w, h)) = bc7_encode_inputs
+            && let Some(host) = crate::seer::host()
+        {
+            host.submit_bc7_encode_for_cache(key_bytes, rgba, w, h);
+        }
 
         // Re-borrow on store. If a concurrent reentrant call raced
         // and populated the slot in the meantime (unlikely on the
