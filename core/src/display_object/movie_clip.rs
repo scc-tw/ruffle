@@ -717,28 +717,24 @@ impl<'gc> MovieClip<'gc> {
         let do_abc = reader.read_do_abc_2()?;
         if !do_abc.data.is_empty() {
             let movie = self.movie();
-            // [seer-patch] `library.avm2_domain()` panics on `unwrap()` if
-            // the entry exists with no domain set yet. We've seen this
-            // fire on PetFightDLL_201308 right after `Loader.load`
-            // completes: `loader.rs::movie_loader_data` calls
-            // `set_avm2_domain` on the new movie's library, but if that
-            // library entry was reaped (e.g., evicted by the asset arena
-            // sweep) and re-created lazily via `library_for_movie_mut`
-            // here, the recreated entry has `avm2_domain == None`.
-            // Bail with a clear log instead of crashing — the SWF will
-            // be missing its ABC scripts, which is bad, but every other
-            // SWF in the player keeps running.
-            let Some(domain) = context
+            // [seer-patch B3 revert 2026-05-05] Restored upstream
+            // `avm2_domain()` (panics if None). The earlier
+            // `try_avm2_domain()` silent-bail (commit bd42f78e4) was
+            // masking the actual race documented in
+            // `library.rs::abandonable_movies` [seer-patch B1] —
+            // sweep was evicting libraries whose Arc<SwfMovie> was
+            // still referenced by AS3 cached `Class` objects in
+            // PetAssetsManager / SkillAssetsManager. With B1 in
+            // place the eviction never fires for these libs, so
+            // domain is always set when DoAbc2 runs. If this panic
+            // ever re-fires we want to see the stack — silent bail
+            // produced cascading `Symbol disappeared` / `non-
+            // registered character ID N` errors that obscured the
+            // root cause for four days.
+            let domain = context
                 .library
                 .library_for_movie_mut(movie.clone())
-                .try_avm2_domain()
-            else {
-                tracing::error!(
-                    movie = %movie.url(),
-                    "do_abc_2: avm2 domain missing for movie library; skipping DoAbc2 tag"
-                );
-                return Ok(None);
-            };
+                .avm2_domain();
             let name = AvmString::new(context.gc(), do_abc.name.decode(reader.encoding()));
 
             match Avm2::do_abc(
@@ -4270,16 +4266,9 @@ impl<'gc, 'a> MovieClip<'gc> {
                 .context
                 .library
                 .library_for_movie_mut(movie.clone());
-            // [seer-patch] Same guard as `do_abc_2` — if the library was
-            // reaped + re-created without `set_avm2_domain` running, skip
-            // SymbolClass binding instead of panicking.
-            let Some(domain) = library.try_avm2_domain() else {
-                tracing::error!(
-                    movie = %movie.url(),
-                    "run_abc_and_symbol_tags: avm2 domain missing; skipping SymbolClass batch"
-                );
-                return Ok(());
-            };
+            // [seer-patch B3 revert 2026-05-05] Restored upstream
+            // `avm2_domain()` — see do_abc_2 above for rationale.
+            let domain = library.avm2_domain();
 
             for (class_name, id) in eager_tags.symbolclass_names {
                 let name = AvmString::new(activation.gc(), class_name);

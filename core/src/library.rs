@@ -1005,6 +1005,40 @@ impl<'gc> Library<'gc> {
             if audio_guard && lib.sound_count() > 0 {
                 continue;
             }
+            // [seer-patch B1 2026-05-05] Skip libraries with a set
+            // AVM2 ApplicationDomain. Reason: AS3 code outside the
+            // stage display tree (e.g. PetAssetsManager /
+            // SkillAssetsManager in PetFightDLL_201308) caches
+            // `Class` references obtained from `applicationDomain`.
+            // Each such Class is bound to a SymbolClass in the
+            // owning movie's library; instantiating it produces a
+            // `MovieClip` whose `self.movie() == swf_arc`. If we
+            // evict the library here, a later access via
+            // `library_for_movie_mut(swf_arc)` lazy-creates an
+            // empty entry with no domain. Preload of that entry's
+            // DoAbc2 / SymbolClass tags then panics at
+            // `library.rs::avm2_domain` (`unwrap` on None) — see
+            // the 16:36:31 panic chain in seer-run.log on the
+            // second fight load.
+            //
+            // The AVM2 domain itself is gc-arena tracked; once the
+            // last AS3 Class reference into it drops, the domain
+            // becomes unreachable and the library naturally
+            // becomes eligible (the next sweep sees the now-None
+            // domain via the `set_avm2_domain` slot still being
+            // Some, but the underlying classes gone — *that* is
+            // the signal AS3 itself has dropped the lib's
+            // characters, and only then is eviction safe).
+            //
+            // Note: this can keep libs alive longer than the
+            // 30 s idle_threshold suggests when AS3 has cached
+            // class refs. For the 賽爾號 fight workload that's
+            // exactly the right behaviour — pet/skill SWFs stay
+            // alive across multiple fights as long as
+            // PetAssetsManager holds them.
+            if lib.avm2_domain.is_some() {
+                continue;
+            }
             out.push(swf_arc);
         }
         out
