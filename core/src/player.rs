@@ -2099,6 +2099,27 @@ impl Player {
         self.enter_arena(|_, gc_root, _| gc_root.library.library_entries())
     }
 
+    /// [seer-patch diag 2026-05-05] Walk the stage tree and yield
+    /// `(class_name, current_frame, header_frames, cur_preload_frame, playing)`
+    /// tuples for every MovieClip whose source SWF URL contains
+    /// `url_substr`. Intended for diagnosing fight-load splash
+    /// (`Mx_Fight_Mc`) timeline progression — `cur_preload_frame`
+    /// gates timeline advance via the
+    /// `(current_frame + 1) >= cur_preload_frame` check in
+    /// `MovieClip::run_frame_internal`, so a stuck preload would
+    /// keep currentFrame just below cur_preload_frame.
+    /// Heavy-ish (full tree walk) — call at most once per second.
+    pub fn seer_dump_movie_clips(
+        &self,
+        url_substr: &str,
+    ) -> Vec<(String, u16, u16, u16, bool)> {
+        let mut out = Vec::new();
+        self.enter_arena(|_, gc_root, _| {
+            seer_walk_clips(gc_root.stage.into(), url_substr, &mut out);
+        });
+        out
+    }
+
     /// [seer-patch] Layer-2 mimalloc-shape sweep: walk the
     /// `MovieLibrary` map, drop entries whose source `SwfMovie`
     /// has no external strong refs and has been idle for at
@@ -3452,6 +3473,46 @@ pub struct DragObject<'gc> {
     /// The bounding rectangle where the clip will be maintained.
     #[collect(require_static)]
     pub constraint: Rectangle<Twips>,
+}
+
+/// [seer-patch diag] Recursive helper for `Player::seer_dump_movie_clips`.
+/// Tuple is `(class_name, current_frame, header_frames, cur_preload_frame, playing)`.
+fn seer_walk_clips<'gc>(
+    node: crate::display_object::DisplayObject<'gc>,
+    url_substr: &str,
+    out: &mut Vec<(String, u16, u16, u16, bool)>,
+) {
+    use crate::display_object::TDisplayObject;
+    if let Some(mc) = node.as_movie_clip() {
+        let url = mc.movie().url().to_string();
+        if url.contains(url_substr) {
+            let class_name = mc
+                .avm2_class()
+                .map(|c| {
+                    c.inner_class_definition()
+                        .name()
+                        .local_name()
+                        .to_string()
+                })
+                .unwrap_or_else(|| format!("char#{}", mc.id()));
+            // `frames_loaded()` returns `cur_preload_frame - 1` —
+            // the public read-side of the preload gate that
+            // `MovieClip::run_frame_internal` checks against.
+            let frames_loaded = mc.frames_loaded().max(0) as u16;
+            out.push((
+                class_name,
+                mc.current_frame(),
+                mc.header_frames(),
+                frames_loaded,
+                mc.playing(),
+            ));
+        }
+    }
+    if let Some(c) = node.as_container() {
+        for child in c.iter_render_list() {
+            seer_walk_clips(child, url_substr, out);
+        }
+    }
 }
 
 /// [seer-patch] Recursively walk the display tree and insert each
