@@ -778,10 +778,29 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             freed_bytes: on_screen.freed_bytes + offscreen.freed_bytes,
         };
         if report.dropped_entries > 0 || report.purged_keys > 0 {
-            // Same caveat as `empty_submit`: drain the wgpu pending-
-            // free list so dropped pool textures release their
-            // gpu-allocator blocks promptly.
+            // [seer-patch 1.7 §1 — tightened 2026-05-04] Drain wgpu's
+            // deferred-destroy queue BEFORE relying on gpu_alloc::cleanup.
+            // ETW (post-Phase-2 fight UI) showed `cleanup()` was running
+            // every 8 deallocs but finding nothing to free because wgpu
+            // holds Arc<Texture> clones in its pending-destroy queue
+            // until GPU sync. `Queue::submit(empty)` flushes encoders;
+            // `Device::poll(PollType::Wait)` blocks until all queued
+            // submits complete, at which point wgpu drops its references
+            // and our subsequent dealloc_block calls actually find
+            // empty blocks.
+            //
+            // Cost: blocks render thread until GPU finishes (~10–30 ms
+            // typical). Acceptable on sweep cadence (every 15 frames =
+            // 0.5 s @ 30 fps); not acceptable per-frame.
             let _ = self.descriptors.queue.submit(std::iter::empty());
+            // Wait until all queued submits complete + callbacks fire,
+            // so wgpu drops its deferred-destroy Arc<Texture> refs and
+            // gpu_alloc's freelists actually have empty blocks for the
+            // next dealloc_block → cleanup() pass.
+            let _ = self.descriptors.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
         }
         report
     }
@@ -1402,7 +1421,19 @@ async fn request_device(
             label: None,
             required_features: features,
             required_limits: limits,
-            memory_hints: Default::default(),
+            // [seer-patch 1.7 §2 — tightened 2026-05-04] Switch from
+            // `Performance` (default — 128 MB starting chunks, 512 MB
+            // final, 32 MB dedicated threshold) to `MemoryUsage` for
+            // gpu_alloc tuning. ETW (post-Phase-2 fight UI) showed
+            // 0 VirtualFree events with 128 MB chunks; smaller chunks
+            // mean less waste per partial-block and faster cleanup
+            // pickup when wgpu's deferred-destroy queue drains.
+            //
+            // `MemoryUsage` config (per wgpu-hal vulkan/adapter.rs:2275):
+            //   starting_free_list_chunk: 8 MB    (was 128 MB)
+            //   final_free_list_chunk:    64 MB   (was 512 MB)
+            //   dedicated_threshold:      8 MB    (was 32 MB)
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         })
