@@ -145,17 +145,13 @@ impl<'gc> BitmapCharacter<'gc> {
             (r.pending_decode_id, r.was_realised)
         };
 
-        // [seer-patch Phase 2] BC7 disk-cache fast path. If the host
-        // has a BC7 payload for this character's compressed source
-        // bytes, upload it as a `Bc7RgbaUnormSrgb` texture (4×
-        // smaller than RGBA8, no JPEG decode). Cache miss falls
-        // through to the existing JPEG-decode path.
-        //
-        // Why before async: BC7 upload is ~free (single
-        // write_texture call, no encode), while async decode pays a
-        // placeholder frame even on what should be the fast path.
-        // Cache hit is the cheapest possible path.
-        if let Some(host) = crate::seer::host()
+        // [seer-patch Phase 2 — bisect step 4 confirmed 2026-05-04]
+        // BC7 cache lookup is THE cause of the visual regression
+        // ("background not showing" / "hang"). Disabled until root-
+        // caused. The tightening trio (CLEANUP_INTERVAL=8 + poll(Wait)
+        // + MemoryUsage) is innocent, kept enabled.
+        if false
+            && let Some(host) = crate::seer::host()
             && let Some(payload) =
                 host.bc7_cache_lookup(self.compressed.key_bytes())
         {
