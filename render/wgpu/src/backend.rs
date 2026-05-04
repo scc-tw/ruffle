@@ -433,8 +433,15 @@ impl<T: RenderTarget + 'static> WgpuRenderBackend<T> {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bc7RgbaUnormSrgb,
-                view_formats: &[wgpu::TextureFormat::Bc7RgbaUnormSrgb],
+                // [seer-patch Phase 2 fix 2026-05-04] Use the linear
+                // (non-sRGB) BC7 format to match `Rgba8Unorm` of the
+                // non-cached upload path. Using `Bc7RgbaUnormSrgb` here
+                // caused the GPU to apply sRGB→linear gamma conversion
+                // to bytes that were encoded as raw linear RGBA8,
+                // distorting colors and making low-alpha edges look
+                // missing (visible as "background disappears").
+                format: wgpu::TextureFormat::Bc7RgbaUnorm,
+                view_formats: &[wgpu::TextureFormat::Bc7RgbaUnorm],
                 // BC7 is GPU-sampled only; we don't render INTO it,
                 // so RENDER_ATTACHMENT and COPY_SRC are unnecessary
                 // (smaller usage = potentially better placement).
