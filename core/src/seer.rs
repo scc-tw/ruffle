@@ -505,6 +505,28 @@ pub trait CoreSeerHost: Send + Sync + 'static {
         _payload: Bc7Payload,
     ) {
     }
+
+    /// [seer-patch Phase 2] Submit a BC7 encode job from a
+    /// cache-miss path. The host is expected to encode `rgba`
+    /// (`width × height × 4` bytes) to BC7 on a background thread
+    /// and call `bc7_cache_store` with the result. This is the
+    /// fire-and-forget entry point that `BitmapCharacter::bitmap_handle`
+    /// uses on cache miss after JPEG decode succeeds.
+    ///
+    /// Why pass the compressed source bytes rather than just the
+    /// RGBA: the cache key is content-addressed on the source
+    /// bytes (so dedup works across SWFs), and the compression
+    /// step happens after decode, so the worker needs both.
+    ///
+    /// Default: no-op (encoder not implemented).
+    fn submit_bc7_encode_for_cache(
+        &self,
+        _compressed_key_bytes: Arc<[u8]>,
+        _rgba: Vec<u8>,
+        _width: u32,
+        _height: u32,
+    ) {
+    }
 }
 
 /// [seer-patch Phase 2] BC7 payload + dimensions handed across the

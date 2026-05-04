@@ -272,7 +272,45 @@ impl<'gc> BitmapCharacter<'gc> {
         // - no host installed,
         // - host couldn't supply a placeholder.
         let decoded = self.compressed.decode()?;
+
+        // [seer-patch Phase 2] Capture RGBA8 pixels + cache key BEFORE
+        // handing the Bitmap to register_bitmap (which consumes it).
+        // We pay one Vec<u8> allocation here (the RGBA8 buffer) per
+        // cold decode; this is the cost of populating the BC7 cache
+        // for the next session. Skip if no host is installed (no
+        // cache to populate).
+        //
+        // Only fire for opaque/RGBA bitmaps with multiple-of-4
+        // dimensions — BC7 requires that.
+        let bc7_encode_inputs = {
+            let s = self.compressed.size();
+            if s.width % 4 == 0
+                && s.height % 4 == 0
+                && crate::seer::host().is_some()
+            {
+                let bm = decoded.clone().to_rgba();
+                Some((
+                    std::sync::Arc::<[u8]>::from(self.compressed.key_bytes()),
+                    bm.data().to_vec(),
+                    s.width,
+                    s.height,
+                ))
+            } else {
+                None
+            }
+        };
+
         let new_handle = backend.register_bitmap(decoded)?;
+
+        // [seer-patch Phase 2] Post the encode job AFTER successful
+        // upload — if the upload failed we don't want to populate
+        // the cache with a payload the GPU couldn't sample.
+        if let Some((key_bytes, rgba, w, h)) = bc7_encode_inputs
+            && let Some(host) = crate::seer::host()
+        {
+            host.submit_bc7_encode_for_cache(key_bytes, rgba, w, h);
+        }
+
         // Re-borrow on store. If a concurrent reentrant call raced
         // and populated the slot in the meantime (unlikely on the
         // single-threaded AVM2 path, but defensive), prefer the
