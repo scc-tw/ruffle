@@ -145,6 +145,60 @@ impl<'gc> BitmapCharacter<'gc> {
             (r.pending_decode_id, r.was_realised)
         };
 
+        // [seer-patch Phase 2] BC7 disk-cache fast path. If the host
+        // has a BC7 payload for this character's compressed source
+        // bytes, upload it as a `Bc7RgbaUnormSrgb` texture (4×
+        // smaller than RGBA8, no JPEG decode). Cache miss falls
+        // through to the existing JPEG-decode path.
+        //
+        // Why before async: BC7 upload is ~free (single
+        // write_texture call, no encode), while async decode pays a
+        // placeholder frame even on what should be the fast path.
+        // Cache hit is the cheapest possible path.
+        if let Some(host) = crate::seer::host()
+            && let Some(payload) =
+                host.bc7_cache_lookup(self.compressed.key_bytes())
+        {
+            // Convert host's `Bc7Payload` to a `Bitmap` with the new
+            // `BitmapFormat::Bc7Rgba` variant. The wgpu backend's
+            // `register_bitmap` short-circuits on this format and
+            // calls `register_bc7_bitmap` (no Rgba conversion).
+            let bitmap = ruffle_render::bitmap::Bitmap::new(
+                payload.width,
+                payload.height,
+                ruffle_render::bitmap::BitmapFormat::Bc7Rgba,
+                // Borrow the Arc<[u8]> as a Vec<u8> via to_vec — one
+                // copy at the layer boundary. Could be eliminated by
+                // teaching `Bitmap` to hold an `Arc<[u8]>` but that's
+                // a larger refactor than Phase 2 needs.
+                payload.data.to_vec(),
+            );
+            match backend.register_bitmap(bitmap) {
+                Ok(handle) => {
+                    let mut r = self.residency.borrow_mut();
+                    r.last_sampled = Some(Instant::now());
+                    r.was_realised = true;
+                    if let Some(existing) = &r.handle {
+                        return Ok(existing.clone());
+                    }
+                    r.handle = Some(handle.clone());
+                    return Ok(handle);
+                }
+                Err(e) => {
+                    // BC7 upload failed (e.g., adapter doesn't
+                    // support TEXTURE_COMPRESSION_BC). Fall through
+                    // to the JPEG decode path. Log once-per-bitmap
+                    // is too noisy; rely on the backend's own
+                    // warning at the feature-check site.
+                    tracing::trace!(
+                        target: "seer_bc7",
+                        error = ?e,
+                        "bc7 upload failed; falling back to JPEG decode",
+                    );
+                }
+            }
+        }
+
         // [seer-patch P1 Day 3] Async decode handling.
         //
         //   Async path is gated on `was_realised`: brand-new
@@ -380,6 +434,21 @@ impl CompressedBitmap {
                 width: define_bits_lossless.width.into(),
                 height: define_bits_lossless.height.into(),
             },
+        }
+    }
+
+    /// [seer-patch Phase 2] Borrow the raw compressed bytes for
+    /// content-addressed cache lookup. JPEG returns the JPEG bytes
+    /// (alpha plane omitted; the cache key is invariant under
+    /// alpha-channel inclusion since the image data is what matters
+    /// for BC7 dedup). Lossless returns the raw zlib payload.
+    ///
+    /// The slice is borrowed for the duration of the call; cache
+    /// implementations should hash, not retain.
+    pub fn key_bytes(&self) -> &[u8] {
+        match self {
+            CompressedBitmap::Jpeg { data, .. } => data,
+            CompressedBitmap::Lossless(define) => &define.data,
         }
     }
     pub fn decode(&self) -> Result<RenderBitmap<'static>, RenderError> {

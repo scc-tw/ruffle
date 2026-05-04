@@ -388,6 +388,99 @@ impl<T: RenderTarget> WgpuRenderBackend<T> {
     }
 }
 
+impl<T: RenderTarget + 'static> WgpuRenderBackend<T> {
+    /// [seer-patch Phase 2] Upload a BC7-pre-encoded bitmap as a
+    /// `Bc7RgbaUnormSrgb` texture. Skips the Rgba conversion +
+    /// clamp_bitmap path because BC7 has no analog of those (data
+    /// is already laid out in 4×4 16-byte blocks).
+    ///
+    /// Errors with `BitmapError::TooLarge` if the adapter doesn't
+    /// support `TEXTURE_COMPRESSION_BC` — caller (the BC7 cache
+    /// integration in `BitmapCharacter::bitmap_handle`) is expected
+    /// to fall back to JPEG decode + RGBA8 in that case.
+    fn register_bc7_bitmap(
+        &mut self,
+        bitmap: Bitmap<'_>,
+    ) -> Result<BitmapHandle, BitmapError> {
+        // Adapter feature gate. wgpu's runtime panics with a clear
+        // message if we use a feature we didn't request, but we
+        // prefer to handle it explicitly here so the caller can
+        // gracefully fall back.
+        if !self
+            .descriptors
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+        {
+            tracing::warn!(
+                target: "seer_bc7",
+                "device lacks TEXTURE_COMPRESSION_BC; cannot upload BC7 bitmap"
+            );
+            return Err(BitmapError::TooLarge);
+        }
+        let extent = wgpu::Extent3d {
+            width: bitmap.width(),
+            height: bitmap.height(),
+            depth_or_array_layers: 1,
+        };
+        let texture_label = create_debug_label!("BC7 Bitmap");
+        let texture = self
+            .descriptors
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: texture_label.as_deref(),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+                view_formats: &[wgpu::TextureFormat::Bc7RgbaUnormSrgb],
+                // BC7 is GPU-sampled only; we don't render INTO it,
+                // so RENDER_ATTACHMENT and COPY_SRC are unnecessary
+                // (smaller usage = potentially better placement).
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+            });
+        // BC7 = 4×4 blocks × 16 bytes per block. bytes_per_row is
+        // measured in compressed-block units (one row = ((w+3)/4) blocks).
+        let blocks_x = extent.width.div_ceil(4);
+        self.descriptors.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: Default::default(),
+                aspect: wgpu::TextureAspect::All,
+            },
+            bitmap.data(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(blocks_x * 16),
+                rows_per_image: None,
+            },
+            extent,
+        );
+        // BC7 = 1 byte per pixel for census purposes (4× smaller
+        // than RGBA8). Tag as `Bitmap` source so the gauge totals
+        // reconcile with what the host expects, while reflecting
+        // the smaller byte cost.
+        let bitmap_bytes = (extent.width as u64) * (extent.height as u64);
+        if let Some(host) = crate::seer::host() {
+            host.on_bitmap_registered(extent.width, extent.height, bitmap_bytes);
+            host.on_texture_registered(crate::seer::TextureSource::Bitmap, bitmap_bytes);
+        }
+        let handle = BitmapHandle(Arc::new(Texture {
+            texture,
+            bind_linear: Default::default(),
+            bind_nearest: Default::default(),
+            copy_count: Cell::new(0),
+            bitmap_bytes,
+            census_source: crate::seer::TextureSource::Bitmap,
+            census_bytes: bitmap_bytes,
+        }));
+        Ok(handle)
+    }
+}
+
 impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
     fn set_viewport_dimensions(&mut self, dimensions: ViewportDimensions) {
         // Avoid panics from creating 0-sized framebuffers.
@@ -702,6 +795,19 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
 
     #[instrument(level = "debug", skip_all)]
     fn register_bitmap(&mut self, bitmap: Bitmap<'_>) -> Result<BitmapHandle, BitmapError> {
+        // [seer-patch Phase 2] BC7 short-circuit: if the bitmap was
+        // already encoded as BC7 by the seer-bc7-cache lookup path,
+        // upload it as a `Bc7RgbaUnormSrgb` texture (4× smaller than
+        // RGBA8) and skip the to_rgba conversion + clamp_bitmap
+        // steps. The byte layout matches wgpu's expected format
+        // (16-byte 4×4 blocks) so `write_texture` accepts it
+        // directly.
+        if matches!(
+            bitmap.format(),
+            ruffle_render::bitmap::BitmapFormat::Bc7Rgba
+        ) {
+            return self.register_bc7_bitmap(bitmap);
+        }
         let mut bitmap = bitmap.to_rgba();
 
         self.clamp_bitmap(&mut bitmap);

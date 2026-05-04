@@ -471,6 +471,58 @@ pub trait CoreSeerHost: Send + Sync + 'static {
     fn bitmap_cache_policy(&self) -> Option<BitmapCachePolicy> {
         None
     }
+
+    /// [seer-patch Phase 2] Look up a BC7-compressed bitmap payload
+    /// in the on-disk cache, keyed by SHA-256 of the compressed
+    /// source bytes (content-addressed). Returns `Some` on hit
+    /// (caller uploads as `Bc7RgbaUnormSrgb` texture); `None` on
+    /// miss (caller falls back to JPEG decode + RGBA8 upload, then
+    /// optionally calls `bc7_cache_store` to populate the cache
+    /// for the next session).
+    ///
+    /// Content-addressed (rather than `(swf_url, char_id)`-keyed)
+    /// because BitmapCharacter doesn't carry SWF context — and
+    /// content-addressed dedupes naturally across SWFs that embed
+    /// the same source bitmap.
+    ///
+    /// Default: `None` (cache disabled / not implemented).
+    fn bc7_cache_lookup(
+        &self,
+        _compressed_bytes: &[u8],
+    ) -> Option<Bc7Payload> {
+        None
+    }
+
+    /// [seer-patch Phase 2] Store a BC7-compressed bitmap payload
+    /// to the on-disk cache. Hosts that implement this typically
+    /// post the payload to a background encode worker which writes
+    /// to disk asynchronously.
+    ///
+    /// Default: no-op.
+    fn bc7_cache_store(
+        &self,
+        _compressed_bytes: &[u8],
+        _payload: Bc7Payload,
+    ) {
+    }
+}
+
+/// [seer-patch Phase 2] BC7 payload + dimensions handed across the
+/// `core` ↔ `seer-flash` (or any other host) boundary. Mirrors the
+/// `seer_bc7_cache::Bc7Payload` struct but lives here so `core`
+/// doesn't need a direct dep on the seer crate.
+///
+/// The host converts between this and its own internal type at the
+/// trait boundary.
+#[derive(Debug, Clone)]
+pub struct Bc7Payload {
+    pub width: u32,
+    pub height: u32,
+    /// 0 = `Bc7RgbaUnorm`, 1 = `Bc7RgbaUnormSrgb`. Mirrors
+    /// `seer_bc7_cache::payload::Bc7Format`.
+    pub format: u8,
+    /// `data.len() == ((width+3)/4) * ((height+3)/4) * 16`.
+    pub data: Arc<[u8]>,
 }
 
 /// A trivial host that returns every upstream default. Useful as a

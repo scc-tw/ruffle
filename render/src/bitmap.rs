@@ -177,6 +177,11 @@ impl<'a> Bitmap<'a> {
                     .collect();
             }
             BitmapFormat::Yuva420p => unreachable!("Can't convert YUVA Bitmap to RGB"),
+            // [seer-patch Phase 2] BC7 → RGB is not a path we hit in
+            // the SWF render flow (BC7 only produced by the disk
+            // cache and consumed directly as a GPU texture). Keep
+            // unreachable rather than CPU-decoding BC7.
+            BitmapFormat::Bc7Rgba => unreachable!("Can't convert BC7 Bitmap to RGB"),
         }
 
         self.format = BitmapFormat::Rgb;
@@ -222,6 +227,15 @@ impl<'a> Bitmap<'a> {
                     .zip(a)
                     .flat_map(|(rgba, a)| [rgba[0].min(*a), rgba[1].min(*a), rgba[2].min(*a), *a])
                     .collect()
+            }
+            // [seer-patch Phase 2] BC7 already encodes RGBA. The GPU
+            // upload path samples it directly as a `Bc7RgbaUnormSrgb`
+            // texture; no CPU-side conversion. If a non-GPU consumer
+            // needs RGBA8, it must call a software BC7 decoder first
+            // — not worth wiring inline since seer's flow goes BC7 →
+            // GPU and never back.
+            BitmapFormat::Bc7Rgba => {
+                unreachable!("BC7 Bitmap is uploaded directly to GPU; CPU-side RGBA conversion not implemented")
             }
         }
 
@@ -296,6 +310,14 @@ pub enum BitmapFormat {
 
     /// planar YUV 420, premultiplied with alpha (RGB channels are to be clamped after conversion)
     Yuva420p,
+
+    /// [seer-patch Phase 2] BC7-compressed RGBA. 8 bits per pixel
+    /// (4× smaller than RGBA8). Layout: 4×4 pixel blocks, each block
+    /// 16 bytes. Used by the `seer-bc7-cache` disk cache to skip
+    /// JPEG decode on warm runs and reduce GPU residency.
+    ///
+    /// `data.len() == ((width+3)/4) * ((height+3)/4) * 16`
+    Bc7Rgba,
 }
 
 impl BitmapFormat {
@@ -307,6 +329,12 @@ impl BitmapFormat {
             BitmapFormat::Yuv420p => width * height + width.div_ceil(2) * height.div_ceil(2) * 2,
             BitmapFormat::Yuva420p => {
                 width * height * 2 + width.div_ceil(2) * height.div_ceil(2) * 2
+            }
+            // [seer-patch Phase 2] BC7 = 16-byte 4×4 blocks.
+            BitmapFormat::Bc7Rgba => {
+                let blocks_x = width.div_ceil(4);
+                let blocks_y = height.div_ceil(4);
+                blocks_x * blocks_y * 16
             }
         }
     }
