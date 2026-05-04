@@ -161,34 +161,71 @@ pub fn buffer_to_image(
     dimensions: &BufferDimensions,
     index: Option<wgpu::SubmissionIndex>,
     size: wgpu::Extent3d,
-) -> image::RgbaImage {
-    capture_image(device, buffer, dimensions, index, |rgba, _buffer_width| {
-        let mut bytes = Vec::with_capacity(dimensions.height * dimensions.unpadded_bytes_per_row);
+) -> Option<image::RgbaImage> {
+    // [seer-patch 2026-05-04] Open-coded version of `capture_image`
+    // that returns `None` instead of panicking when the readback
+    // buffer's `map_async` callback fires with `Err`. Trigger seen in
+    // the wild: under sustained allocator pressure, a HAL call
+    // (e.g. `create_texture_view`) returns `OutOfMemory` /
+    // `DeviceLost`. `wgpu_core::Device::handle_hal_error` then calls
+    // `self.lose()`, and the next `Device::poll(Wait)` invokes
+    // `release_gpu_resources()` which `.destroy()`s every buffer +
+    // texture the device is tracking — including `TextureTarget`'s
+    // long-lived owned readback buffer. With the upstream code path
+    // (`capture_image`'s `let _ = receiver.recv()`), the failure is
+    // silently swallowed and `Buffer::get_mapped_range` then panics
+    // with "Buffer with '' label has been destroyed". Surfacing the
+    // failure as `None` lets the host present a stale frame instead
+    // of crashing while we investigate the underlying lose-device
+    // event (see docs/plans/bitmap-memory-review.md §1.7 §1).
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let buffer_slice = buffer.slice(..);
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    if let Err(e) = device.poll(wgpu::PollType::Wait {
+        submission_index: index,
+        timeout: None,
+    }) {
+        tracing::warn!(error = ?e, "device.poll(Wait) failed during readback; skipping frame");
+        return None;
+    }
+    if let Err(_e) = receiver.recv().expect("MPSC channel must not fail") {
+        tracing::warn!(
+            "readback buffer map_async failed (device likely lost); skipping frame"
+        );
+        return None;
+    }
 
-        for chunk in rgba.chunks(dimensions.padded_bytes_per_row as usize) {
-            bytes.extend_from_slice(&chunk[..dimensions.unpadded_bytes_per_row]);
-        }
+    let map = buffer_slice.get_mapped_range();
+    let mut bytes = Vec::with_capacity(dimensions.height * dimensions.unpadded_bytes_per_row);
+    for chunk in map.chunks(dimensions.padded_bytes_per_row as usize) {
+        bytes.extend_from_slice(&chunk[..dimensions.unpadded_bytes_per_row]);
+    }
+    drop(map);
+    buffer.unmap();
 
-        // The image copied from the GPU uses premultiplied alpha, so
-        // convert to straight alpha if requested by the user.
-        //
-        // [seer-patch] When a `SeerHost` is installed and asks for
-        // it, we skip this per-pixel CPU pass — at 1280×720 it
-        // costs ~10 ms per readback on the rendered-tick fast path.
-        // Hosts that consume premultiplied data (Slint via
-        // `Image::from_rgba8_premultiplied`, GPU compositors, …)
-        // opt in by overriding `SeerHost::skip_unmultiply_on_capture`.
-        // With no host installed the slot is `None` and we fall
-        // through to the upstream Ruffle path.
-        let skip_unmul = crate::seer::host()
-            .is_some_and(|h| h.skip_unmultiply_on_capture());
-        if !skip_unmul {
-            ruffle_render::utils::unmultiply_alpha_rgba(&mut bytes);
-        }
+    // The image copied from the GPU uses premultiplied alpha, so
+    // convert to straight alpha if requested by the user.
+    //
+    // [seer-patch] When a `SeerHost` is installed and asks for
+    // it, we skip this per-pixel CPU pass — at 1280×720 it
+    // costs ~10 ms per readback on the rendered-tick fast path.
+    // Hosts that consume premultiplied data (Slint via
+    // `Image::from_rgba8_premultiplied`, GPU compositors, …)
+    // opt in by overriding `SeerHost::skip_unmultiply_on_capture`.
+    // With no host installed the slot is `None` and we fall
+    // through to the upstream Ruffle path.
+    let skip_unmul = crate::seer::host()
+        .is_some_and(|h| h.skip_unmultiply_on_capture());
+    if !skip_unmul {
+        ruffle_render::utils::unmultiply_alpha_rgba(&mut bytes);
+    }
 
+    Some(
         image::RgbaImage::from_raw(size.width, size.height, bytes)
-            .expect("Retrieved texture buffer must be a valid RgbaImage")
-    })
+            .expect("Retrieved texture buffer must be a valid RgbaImage"),
+    )
 }
 
 pub fn supported_sample_count(

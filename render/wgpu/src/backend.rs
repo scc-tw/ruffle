@@ -58,6 +58,56 @@ pub fn create_wgpu_instance(
             .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
             .with_env(),
         backend_options,
+        // [seer-patch 2026-05-04] Memory-budget thresholds — the
+        // root-cause fix for the "Buffer with '' label has been
+        // destroyed" crash that was triggered after a large
+        // `pool-sweep ... freed_mb=821` flushed many bitmap textures
+        // back to gpu-alloc. The crash chain was: a follow-on
+        // `vkAllocateMemory` (driven by serverList / ServerAdPanel1
+        // bitmap loads) returned OUT_OF_DEVICE_MEMORY, wgpu_core's
+        // `handle_hal_error` (resource.rs:609-617) treated that as
+        // FATAL → `Device::lose()` → `release_gpu_resources()` (line
+        // 4596) explicitly `.destroy()`-d every buffer + texture the
+        // device tracked, including `TextureTarget`'s long-lived
+        // owned PBO — so the next `Buffer::get_mapped_range` panicked
+        // with "destroyed".
+        //
+        // wgpu v27.0.4 plumbs `VK_EXT_memory_budget` through
+        // `error_if_would_oom_on_resource_allocation` (device.rs:997)
+        // and `Device::check_if_oom` (device.rs:2830). With the
+        // default `MemoryBudgetThresholds { None, None }` the budget
+        // check is a no-op. Setting `for_resource_creation` makes
+        // `create_texture/buffer/query_set` proactively return a
+        // *non-fatal* `OutOfMemory` (routed through
+        // `handle_hal_error_with_nonfatal_oom`) BEFORE the driver
+        // gets to fail the allocation — letting the host fall back
+        // to a smaller texture, evict, or skip the bitmap rather
+        // than the device dying.
+        //
+        // Thresholds, percent of the budget reported by
+        // `vkGetPhysicalDeviceMemoryProperties2` for the relevant
+        // heap (host-visible vs. device-local). Tuned conservatively
+        // for Intel UMA: `heap_budget` on iGPUs reflects the entire
+        // shared pool so the percent translates differently than on
+        // a discrete GPU. Start at:
+        //
+        //   for_resource_creation = 70  → bitmap allocs start
+        //                                  failing well before driver OOM
+        //   for_device_loss       = 95  → only lose the device on a
+        //                                  hard memory-exhaustion ceiling
+        //
+        // Tune from `seer_perf` rss_mb if bitmaps start dropping too
+        // eagerly (raise) or if device-loss still slips through
+        // (lower for_device_loss).
+        //
+        // Refs:
+        //   - wgpu PR #7472: OOM detection (merged v26)
+        //   - wgpu Issue #7460: Implement out-of-memory detection
+        //   - PhysicalDeviceMemoryBudgetPropertiesEXT
+        memory_budget_thresholds: wgpu::MemoryBudgetThresholds {
+            for_resource_creation: Some(70),
+            for_device_loss: Some(95),
+        },
         ..Default::default()
     })
 }
@@ -185,18 +235,18 @@ impl WgpuRenderBackend<crate::target::TextureTarget> {
 
     pub fn capture_frame(&self) -> Option<image::RgbaImage> {
         use crate::utils::buffer_to_image;
-        if let Some(buffer) = &self.target.buffer {
-            let (buffer, dimensions) = buffer.buffer.inner();
-            Some(buffer_to_image(
-                &self.descriptors.device,
-                buffer,
-                dimensions,
-                None,
-                self.target.size,
-            ))
-        } else {
-            None
-        }
+        let buffer = self.target.buffer.as_ref()?;
+        let (buffer, dimensions) = buffer.buffer.inner();
+        // `buffer_to_image` returns `None` if the readback buffer was
+        // destroyed by a device-lost event mid-frame (see the
+        // [seer-patch 2026-05-04] note in `utils.rs::buffer_to_image`).
+        buffer_to_image(
+            &self.descriptors.device,
+            buffer,
+            dimensions,
+            None,
+            self.target.size,
+        )
     }
 }
 
