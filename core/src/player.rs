@@ -2120,6 +2120,19 @@ impl Player {
         out
     }
 
+    /// [seer-patch diag 2026-05-05] Coarse stage-tree audit — counts
+    /// MovieClips and dumps the first N distinct movie URLs, used to
+    /// confirm whether `seer_dump_movie_clips`'s URL filter is
+    /// missing the target. Returns `(total_mcs, distinct_urls)`.
+    pub fn seer_dump_all_movie_urls(&self, max_urls: usize) -> (usize, Vec<String>) {
+        let mut total = 0usize;
+        let mut urls: Vec<String> = Vec::new();
+        self.enter_arena(|_, gc_root, _| {
+            seer_walk_collect_urls(gc_root.stage.into(), &mut total, &mut urls, max_urls);
+        });
+        (total, urls)
+    }
+
     /// [seer-patch] Layer-2 mimalloc-shape sweep: walk the
     /// `MovieLibrary` map, drop entries whose source `SwfMovie`
     /// has no external strong refs and has been idle for at
@@ -3473,6 +3486,28 @@ pub struct DragObject<'gc> {
     /// The bounding rectangle where the clip will be maintained.
     #[collect(require_static)]
     pub constraint: Rectangle<Twips>,
+}
+
+/// [seer-patch diag] Recursive helper for `Player::seer_dump_all_movie_urls`.
+fn seer_walk_collect_urls<'gc>(
+    node: crate::display_object::DisplayObject<'gc>,
+    total: &mut usize,
+    urls: &mut Vec<String>,
+    max_urls: usize,
+) {
+    use crate::display_object::TDisplayObject;
+    if let Some(mc) = node.as_movie_clip() {
+        *total += 1;
+        let url = mc.movie().url().to_string();
+        if !urls.iter().any(|u| u == &url) && urls.len() < max_urls {
+            urls.push(url);
+        }
+    }
+    if let Some(c) = node.as_container() {
+        for child in c.iter_render_list() {
+            seer_walk_collect_urls(child, total, urls, max_urls);
+        }
+    }
 }
 
 /// [seer-patch diag] Recursive helper for `Player::seer_dump_movie_clips`.
