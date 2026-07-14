@@ -2101,21 +2101,18 @@ impl Player {
 
     /// [seer-patch diag 2026-05-05] Walk the stage tree and yield
     /// `(class_name, current_frame, header_frames, cur_preload_frame, playing)`
-    /// tuples for every MovieClip whose source SWF URL contains
-    /// `url_substr`. Intended for diagnosing fight-load splash
-    /// (`Mx_Fight_Mc`) timeline progression — `cur_preload_frame`
-    /// gates timeline advance via the
-    /// `(current_frame + 1) >= cur_preload_frame` check in
-    /// `MovieClip::run_frame_internal`, so a stuck preload would
-    /// keep currentFrame just below cur_preload_frame.
-    /// Heavy-ish (full tree walk) — call at most once per second.
+    /// tuples for every MovieClip whose URL contains `url_substr`
+    /// OR whose AVM2 class name contains `class_substr`. Either
+    /// arg can be empty (no constraint). Intended for diagnosing
+    /// fight-load splash (`Mx_Fight_Mc`) timeline progression.
     pub fn seer_dump_movie_clips(
         &self,
         url_substr: &str,
+        class_substr: &str,
     ) -> Vec<(String, u16, u16, u16, bool)> {
         let mut out = Vec::new();
         self.enter_arena(|_, gc_root, _| {
-            seer_walk_clips(gc_root.stage.into(), url_substr, &mut out);
+            seer_walk_clips(gc_root.stage.into(), url_substr, class_substr, &mut out);
         });
         out
     }
@@ -3515,21 +3512,24 @@ fn seer_walk_collect_urls<'gc>(
 fn seer_walk_clips<'gc>(
     node: crate::display_object::DisplayObject<'gc>,
     url_substr: &str,
+    class_substr: &str,
     out: &mut Vec<(String, u16, u16, u16, bool)>,
 ) {
     use crate::display_object::TDisplayObject;
     if let Some(mc) = node.as_movie_clip() {
+        let class_name = mc
+            .avm2_class()
+            .map(|c| {
+                c.inner_class_definition()
+                    .name()
+                    .local_name()
+                    .to_string()
+            })
+            .unwrap_or_else(|| format!("char#{}", mc.id()));
         let url = mc.movie().url().to_string();
-        if url.contains(url_substr) {
-            let class_name = mc
-                .avm2_class()
-                .map(|c| {
-                    c.inner_class_definition()
-                        .name()
-                        .local_name()
-                        .to_string()
-                })
-                .unwrap_or_else(|| format!("char#{}", mc.id()));
+        let url_match = !url_substr.is_empty() && url.contains(url_substr);
+        let class_match = !class_substr.is_empty() && class_name.contains(class_substr);
+        if url_match || class_match {
             // `frames_loaded()` returns `cur_preload_frame - 1` —
             // the public read-side of the preload gate that
             // `MovieClip::run_frame_internal` checks against.
@@ -3545,7 +3545,7 @@ fn seer_walk_clips<'gc>(
     }
     if let Some(c) = node.as_container() {
         for child in c.iter_render_list() {
-            seer_walk_clips(child, url_substr, out);
+            seer_walk_clips(child, url_substr, class_substr, out);
         }
     }
 }
