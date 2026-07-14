@@ -287,7 +287,12 @@ impl AudioBackend for NullAudioBackend {
 
     fn stop_all_sounds(&mut self) {}
     fn get_sound_position(&self, _instance: SoundInstanceHandle) -> Option<f64> {
-        Some(0.0)
+        // A null backend does not play sounds. Reporting a permanently
+        // stationary 0 ms position makes timeline-audio synchronization
+        // subtract the same negative skew every tick, preventing future
+        // frames from running. `None` also matches this method's contract
+        // for an instance that is not playing.
+        None
     }
     fn get_sound_duration(&self, sound: SoundHandle) -> Option<FloatDuration> {
         if let Some(sound) = self.sounds.get(sound) {
@@ -330,6 +335,17 @@ impl AudioBackend for NullAudioBackend {
 impl Default for NullAudioBackend {
     fn default() -> Self {
         NullAudioBackend::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_backend_does_not_report_stationary_playback() {
+        let backend = NullAudioBackend::new();
+        assert_eq!(backend.get_sound_position(SoundInstanceHandle::null()), None);
     }
 }
 
