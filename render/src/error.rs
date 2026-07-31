@@ -9,6 +9,9 @@ pub enum Error {
     #[error("Bitmap texture is larger than the rendering device supports")]
     TooLarge,
 
+    #[error("Bitmap texture allocation exceeds the configured memory budget")]
+    OutOfMemory,
+
     #[error("Unknown bitmap format")]
     UnknownType,
 

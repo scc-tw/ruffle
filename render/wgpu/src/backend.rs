@@ -1359,6 +1359,12 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
             height,
             depth_or_array_layers: 1,
         };
+        let cache_bytes = (width as u64) * (height as u64) * 4;
+        if let Some(host) = crate::seer::host()
+            && !host.allow_texture_allocation(crate::seer::TextureSource::BitmapCache, cache_bytes)
+        {
+            return Err(BitmapError::OutOfMemory);
+        }
 
         let texture_label = create_debug_label!("Bitmap");
         let texture = self
@@ -1382,7 +1388,6 @@ impl<T: RenderTarget + 'static> RenderBackend for WgpuRenderBackend<T> {
         // textures uniform-shape, characteristic of these). Tag them
         // so `TextureCensus.cache_mb` exposes the load. Phase 1.6c
         // adds idle-eviction.
-        let cache_bytes = (width as u64) * (height as u64) * 4;
         if let Some(host) = crate::seer::host() {
             host.on_texture_registered(
                 crate::seer::TextureSource::BitmapCache,

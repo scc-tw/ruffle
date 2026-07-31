@@ -173,6 +173,13 @@ pub trait SeerHost: Send + Sync + 'static {
     ///
     /// Default: no-op.
     fn on_texture_dropped(&self, _source: TextureSource, _bytes: u64) {}
+
+    /// Decide whether a texture allocation may proceed. Hosts can use
+    /// their live census to impose a hard admission budget before the
+    /// graphics API turns memory pressure into a fatal device OOM.
+    fn allow_texture_allocation(&self, _source: TextureSource, _bytes: u64) -> bool {
+        true
+    }
 }
 
 /// A trivial host that returns every upstream default. Useful as a
