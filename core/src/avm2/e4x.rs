@@ -1019,10 +1019,8 @@ impl<'gc> E4XNode<'gc> {
         let mut attribute_nodes = Vec::new();
         let mut namespaces = Vec::new();
 
-        let attributes = bs
-            .attributes()
-            .collect::<Result<Vec<_>, XmlAttrError>>()
-            .map_err(|e| {
+        for attribute in bs.attributes() {
+            let attribute = attribute.map_err(|e| {
                 let code = match e {
                     XmlAttrError::Duplicated(_, _) => XmlErrorCode::DuplicateAttribute,
                     _ => XmlErrorCode::ElementMalformed,
@@ -1030,8 +1028,6 @@ impl<'gc> E4XNode<'gc> {
 
                 make_xml_error(activation, code)
             })?;
-
-        for attribute in attributes {
             let value_str = avm2_unescape(&attribute.value)
                 .map_err(|_| make_xml_error(activation, XmlErrorCode::ElementMalformed))?;
             let value = AvmString::new_utf8(activation.gc(), value_str);
@@ -1044,16 +1040,18 @@ impl<'gc> E4XNode<'gc> {
             let namespace = match ns {
                 ResolveResult::Bound(ns) if ns.into_inner() == b"http://www.w3.org/2000/xmlns/" => {
                     namespaces.push(E4XNamespace {
-                        uri: value,
+                        uri: activation.strings().intern(value).into(),
                         prefix: Some(name),
                     });
                     continue;
                 }
                 ResolveResult::Bound(ns) => {
                     let prefix = attribute.key.prefix().map(|prefix| {
-                        AvmString::new_utf8_bytes(activation.gc(), prefix.into_inner())
+                        let prefix = ruffle_wstr::from_utf8_bytes(prefix.into_inner());
+                        activation.strings().intern_wstr(prefix).into()
                     });
-                    let uri = AvmString::new_utf8_bytes(activation.gc(), ns.into_inner());
+                    let uri = ruffle_wstr::from_utf8_bytes(ns.into_inner());
+                    let uri = activation.strings().intern_wstr(uri).into();
                     Some(E4XNamespace { prefix, uri })
                 }
                 ResolveResult::Unknown(ns) => {
@@ -1063,7 +1061,7 @@ impl<'gc> E4XNode<'gc> {
                     // The default XML namespace declaration
                     if &*name == b"xmlns" {
                         namespaces.push(E4XNamespace {
-                            uri: value,
+                            uri: activation.strings().intern(value).into(),
                             prefix: Some(istr!("")),
                         });
                         continue;
@@ -1095,8 +1093,12 @@ impl<'gc> E4XNode<'gc> {
                 let prefix = bs
                     .name()
                     .prefix()
-                    .map(|prefix| AvmString::new_utf8_bytes(activation.gc(), prefix.into_inner()));
-                let uri = AvmString::new_utf8_bytes(activation.gc(), ns.into_inner());
+                    .map(|prefix| {
+                        let prefix = ruffle_wstr::from_utf8_bytes(prefix.into_inner());
+                        activation.strings().intern_wstr(prefix).into()
+                    });
+                let uri = ruffle_wstr::from_utf8_bytes(ns.into_inner());
+                let uri = activation.strings().intern_wstr(uri).into();
                 Some(E4XNamespace { prefix, uri })
             }
             ResolveResult::Unknown(ns) => {

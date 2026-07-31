@@ -8,7 +8,9 @@ pub use crate::avm2::object::xml_allocator;
 use crate::avm2::object::{E4XOrXml, QNameObject, TObject, XmlListObject, XmlObject};
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::string::AvmString;
-use crate::avm2::{Activation, ArrayObject, ArrayStorage, Error, Multiname, Object, Value};
+use crate::avm2::{
+    Activation, ArrayObject, ArrayStorage, Error, Multiname, Namespace, Object, Value,
+};
 use crate::avm2_stub_method;
 
 pub fn init<'gc>(
@@ -216,7 +218,9 @@ pub fn name<'gc>(
     let xml = this.as_xml_object().unwrap();
 
     if let Some(local_name) = xml.local_name() {
-        let namespace = xml.namespace_object(activation, &[])?.namespace();
+        let api_version = activation.avm2().root_api_version;
+        let namespace = xml.node().get_namespace(activation.strings(), &[]);
+        let namespace = Namespace::package(namespace.uri, api_version, activation.strings());
         let mut multiname = Multiname::new(namespace, local_name);
         multiname.set_is_attribute(xml.node().is_attribute());
         Ok(QNameObject::from_name(activation, multiname).into())

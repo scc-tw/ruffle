@@ -527,10 +527,10 @@ impl<'gc> TObject<'gc> for XmlListObject<'gc> {
 
         // 3. For i = 0 to x.[[Length]]-1,
         for child in children.iter_mut() {
-            let child = child.get_or_create_xml(activation);
-
             // 3.a. If x[i].[[Class]] == "element",
             if child.node().is_element() {
+                let child = child.get_or_create_xml(activation);
+
                 // 3.a.i. Let gq be the result of calling the [[Get]] method of x[i] with argument P
                 let gq = child.get_property_local(name, activation)?;
 
