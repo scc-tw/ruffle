@@ -72,6 +72,14 @@ impl Filter {
     }
 
     pub fn calculate_dest_rect(&self, source_rect: Rectangle<Twips>) -> Rectangle<Twips> {
+        // Empty display objects use Rectangle::INVALID as a sentinel.
+        // Growing that sentinel turns it into a real rectangle near
+        // 0x07ffffff twips (about 6.71 million pixels), which then poisons
+        // ancestor bounds and creates a cacheAsBitmap render storm.
+        if !source_rect.is_valid() {
+            return source_rect;
+        }
+
         match self {
             Filter::BlurFilter(filter) => filter.calculate_dest_rect(source_rect),
             Filter::GlowFilter(filter) => filter.calculate_dest_rect(source_rect),
@@ -180,5 +188,25 @@ impl DisplacementMapFilter {
         // } else {
         //     source_rect
         // }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Filter;
+    use swf::{BlurFilter, BlurFilterFlags, Fixed16, Rectangle, Twips};
+
+    #[test]
+    fn filter_preserves_invalid_source_bounds() {
+        let filter = Filter::BlurFilter(BlurFilter {
+            blur_x: Fixed16::from_f64(16.0),
+            blur_y: Fixed16::from_f64(16.0),
+            flags: BlurFilterFlags::from_passes(1),
+        });
+
+        let bounds = filter.calculate_dest_rect(Rectangle::<Twips>::INVALID);
+
+        assert_eq!(bounds, Rectangle::INVALID);
+        assert!(!bounds.is_valid());
     }
 }
