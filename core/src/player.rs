@@ -2131,11 +2131,11 @@ impl Player {
     }
 
     /// [seer-patch] Layer-2 mimalloc-shape sweep: walk the
-    /// `MovieLibrary` map, drop entries whose source `SwfMovie`
-    /// has no external strong refs and has been idle for at
-    /// least `policy.idle_threshold`, then flush the wgpu free
-    /// queue so released `BitmapHandle`s actually return GPU
-    /// memory to gpu-allocator.
+    /// `MovieLibrary` map, drop entries whose source movie is absent
+    /// from the live display tree and has been idle for at least
+    /// `policy.idle_threshold`. Independently drops idle GPU shape
+    /// handles while retaining their SWF definitions, then flushes
+    /// wgpu's free queue.
     ///
     /// Two-pass internally: pass 1 (shared borrow) collects the
     /// set of evictable Arcs and tallies their bitmap bytes; pass
@@ -2156,6 +2156,12 @@ impl Player {
         let mut report = crate::seer::SweepReport::default();
 
         self.enter_arena_mut(|gc_context, gc_root, _| {
+            let now = web_time::Instant::now();
+            for library in gc_root.library.iter_libraries() {
+                report.evicted_shape_handles +=
+                    library.evict_idle_shape_handles(now, policy.idle_threshold);
+            }
+
             // [seer-patch] Build the "live movie" set by walking the
             // stage's display tree. This is the eviction gate's only
             // liveness signal — see `Library::abandonable_movies` for
@@ -2230,7 +2236,7 @@ impl Player {
         // (b) on the *next* sweep the previous sweep's frees
         // (now collected) get queue-flushed promptly. The first
         // submit's effective work happens one sweep later.
-        if report.removed > 0 {
+        if report.removed > 0 || report.evicted_shape_handles > 0 {
             self.renderer.empty_submit();
         }
 

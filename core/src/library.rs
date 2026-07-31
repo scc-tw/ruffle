@@ -256,6 +256,21 @@ impl<'gc> MovieLibrary<'gc> {
             .count()
     }
 
+    /// Drop GPU shape handles that have not been rendered recently while
+    /// retaining all SWF character and AVM2 domain state.
+    pub fn evict_idle_shape_handles(&self, now: Instant, idle_threshold: Duration) -> usize {
+        self.characters
+            .values()
+            .map(|character| match character {
+                Character::Graphic(graphic) => {
+                    usize::from(graphic.evict_shape_if_idle(now, idle_threshold))
+                }
+                Character::MorphShape(morph) => morph.evict_shapes_if_idle(now, idle_threshold),
+                _ => 0,
+            })
+            .sum()
+    }
+
     /// Registers a character; returns `true` if successful, or `false` if a character with
     /// the given ID already exists.
     pub fn register_character(&mut self, id: CharacterId, character: Character<'gc>) -> bool {
@@ -1021,21 +1036,12 @@ impl<'gc> Library<'gc> {
             // the 16:36:31 panic chain in seer-run.log on the
             // second fight load.
             //
-            // The AVM2 domain itself is gc-arena tracked; once the
-            // last AS3 Class reference into it drops, the domain
-            // becomes unreachable and the library naturally
-            // becomes eligible (the next sweep sees the now-None
-            // domain via the `set_avm2_domain` slot still being
-            // Some, but the underlying classes gone — *that* is
-            // the signal AS3 itself has dropped the lib's
-            // characters, and only then is eviction safe).
-            //
-            // Note: this can keep libs alive longer than the
-            // 30 s idle_threshold suggests when AS3 has cached
-            // class refs. For the 賽爾號 fight workload that's
-            // exactly the right behaviour — pet/skill SWFs stay
-            // alive across multiple fights as long as
-            // PetAssetsManager holds them.
+            // The library owns this domain, so the Option does not
+            // become None when external Class references disappear.
+            // This deliberately retains every AVM2 library until a
+            // sound reachability signal exists. Bitmap and shape
+            // residency sweeps reclaim their GPU resources without
+            // invalidating cached classes or SymbolClass identity.
             if lib.avm2_domain.is_some() {
                 continue;
             }

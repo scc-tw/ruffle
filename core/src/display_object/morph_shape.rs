@@ -13,9 +13,11 @@ use gc_arena::{Collect, Gc, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::sync::Arc;
+use std::time::Duration;
 use swf::{Fixed8, Fixed16};
+use web_time::Instant;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -54,6 +56,24 @@ impl<'gc> MorphShape<'gc> {
                 object: Lock::new(None),
             },
         ))
+    }
+
+    /// Drop all interpolated GPU shapes after this morph shape has not been
+    /// rendered for `idle_threshold`. Interpolated SWF shapes stay cached.
+    pub fn evict_shapes_if_idle(self, now: Instant, idle_threshold: Duration) -> usize {
+        let shared = self.0.shared.get();
+        let Some(last_rendered) = shared.last_rendered.get() else {
+            return 0;
+        };
+        if now.duration_since(last_rendered) < idle_threshold {
+            return 0;
+        }
+        shared
+            .frames
+            .borrow_mut()
+            .values_mut()
+            .map(|frame| usize::from(frame.shape_handle.take().is_some()))
+            .sum()
     }
 }
 
@@ -114,6 +134,7 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
     fn render_self(self, context: &mut RenderContext) {
         let ratio = self.ratio();
         let shared = self.0.shared.get();
+        shared.last_rendered.set(Some(Instant::now()));
         let shape_handle = shared.get_shape(context, context.library, ratio);
         context
             .commands
@@ -191,6 +212,7 @@ pub struct MorphShapeShared {
     start: swf::MorphShape,
     end: swf::MorphShape,
     frames: RefCell<fnv::FnvHashMap<u16, Frame>>,
+    last_rendered: Cell<Option<Instant>>,
     movie: Arc<SwfMovie>,
 }
 
@@ -201,6 +223,7 @@ impl MorphShapeShared {
             start: swf_tag.start.clone(),
             end: swf_tag.end.clone(),
             frames: RefCell::new(fnv::FnvHashMap::default()),
+            last_rendered: Cell::new(None),
             movie,
         }
     }

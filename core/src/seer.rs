@@ -58,6 +58,9 @@ pub struct SweepReport {
     /// removed libraries, measured at remove time). The actual
     /// reclamation lags by one wgpu submit + one gc-arena cycle.
     pub freed_bitmap_bytes: u64,
+    /// Number of static or interpolated GPU shape handles dropped while their
+    /// source SWF characters remain available for lazy reconstruction.
+    pub evicted_shape_handles: usize,
 }
 
 /// Tunables for the layer-2 asset arena (per-SWF mimalloc-shaped
@@ -347,9 +350,9 @@ pub struct LibraryEntry {
     pub sound_count: usize,
     /// Time since any character lookup touched this library.
     pub idle_for: Duration,
-    /// `Arc::strong_count(&swf) - 1` (subtract the MovieLibrary's
-    /// own strong ref). `0` means the library is abandonable,
-    /// subject to the idle / audio / root gates.
+    /// Approximate `Arc<SwfMovie>` references outside the library map entry.
+    /// This includes AVM2-internal references and is diagnostic only; display
+    /// tree and domain gates determine whether a library is abandonable.
     pub external_refs: usize,
 }
 

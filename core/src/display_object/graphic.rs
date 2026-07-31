@@ -17,8 +17,10 @@ use gc_arena::{Collect, Gc, Mutation};
 use ruffle_common::utils::HasPrefixField;
 use ruffle_render::backend::ShapeHandle;
 use ruffle_render::commands::CommandHandler;
-use std::cell::{OnceCell, RefCell, RefMut};
+use std::cell::{Cell, OnceCell, RefCell, RefMut};
 use std::sync::Arc;
+use std::time::Duration;
+use web_time::Instant;
 
 #[derive(Clone, Collect, Copy)]
 #[collect(no_drop)]
@@ -52,18 +54,7 @@ impl<'gc> Graphic<'gc> {
         swf_shape: swf::Shape,
         movie: Arc<SwfMovie>,
     ) -> Self {
-        let library = context.library.library_for_movie(movie.clone()).unwrap();
-        let shared = GraphicShared {
-            id: swf_shape.id,
-            bounds: swf_shape.shape_bounds,
-            render_handle: Some(
-                context
-                    .renderer
-                    .register_shape((&swf_shape).into(), &MovieLibrarySource { library }),
-            ),
-            shape: swf_shape,
-            movie,
-        };
+        let shared = GraphicShared::from_swf_shape(swf_shape, movie);
 
         Graphic(Gc::new(
             context.gc(),
@@ -82,7 +73,8 @@ impl<'gc> Graphic<'gc> {
         let shared = GraphicShared {
             id: 0,
             bounds: Default::default(),
-            render_handle: None,
+            render_handle: RefCell::new(None),
+            last_rendered: Cell::new(None),
             shape: swf::Shape {
                 version: 32,
                 id: 0,
@@ -116,6 +108,12 @@ impl<'gc> Graphic<'gc> {
 
     pub fn set_avm2_class(self, mc: &Mutation<'gc>, class: Avm2ClassObject<'gc>) {
         unlock!(Gc::write(mc, self.0), GraphicData, class).set(Some(class));
+    }
+
+    /// Drop the lazily-created GPU shape after it has not been rendered for
+    /// `idle_threshold`. The source SWF shape remains available for rebuild.
+    pub fn evict_shape_if_idle(self, now: Instant, idle_threshold: Duration) -> bool {
+        self.0.shared.get().evict_shape_if_idle(now, idle_threshold)
     }
 
     fn set_shared(self, mc: &Mutation<'gc>, shared: Gc<'gc, GraphicShared>) {
@@ -201,7 +199,22 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 
         if let Some(drawing) = self.0.drawing.get() {
             drawing.borrow().render(context);
-        } else if let Some(render_handle) = self.0.shared.get().render_handle.clone() {
+        } else {
+            let shared = self.0.shared.get();
+            shared.last_rendered.set(Some(Instant::now()));
+            let render_handle = if let Some(handle) = shared.render_handle.borrow().clone() {
+                handle
+            } else {
+                let library = context
+                    .library
+                    .library_for_movie(shared.movie.clone())
+                    .unwrap();
+                let handle = context
+                    .renderer
+                    .register_shape((&shared.shape).into(), &MovieLibrarySource { library });
+                *shared.render_handle.borrow_mut() = Some(handle.clone());
+                handle
+            };
             context
                 .commands
                 .render_shape(render_handle, context.transform_stack.transform())
@@ -275,7 +288,75 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
 struct GraphicShared {
     id: CharacterId,
     shape: swf::Shape,
-    render_handle: Option<ShapeHandle>,
+    render_handle: RefCell<Option<ShapeHandle>>,
+    last_rendered: Cell<Option<Instant>>,
     bounds: Rectangle<Twips>,
     movie: Arc<SwfMovie>,
+}
+
+impl GraphicShared {
+    fn from_swf_shape(shape: swf::Shape, movie: Arc<SwfMovie>) -> Self {
+        Self {
+            id: shape.id,
+            bounds: shape.shape_bounds,
+            render_handle: RefCell::new(None),
+            last_rendered: Cell::new(None),
+            shape,
+            movie,
+        }
+    }
+
+    fn evict_shape_if_idle(&self, now: Instant, idle_threshold: Duration) -> bool {
+        let Some(last_rendered) = self.last_rendered.get() else {
+            return false;
+        };
+        if now.duration_since(last_rendered) < idle_threshold {
+            return false;
+        }
+        self.render_handle.borrow_mut().take().is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruffle_render::backend::ShapeHandleImpl;
+
+    #[derive(Debug)]
+    struct TestShapeHandle;
+
+    impl ShapeHandleImpl for TestShapeHandle {}
+
+    fn test_shape() -> swf::Shape {
+        swf::Shape {
+            version: 32,
+            id: 1,
+            shape_bounds: Default::default(),
+            edge_bounds: Default::default(),
+            flags: swf::ShapeFlag::empty(),
+            styles: swf::ShapeStyles {
+                fill_styles: Vec::new(),
+                line_styles: Vec::new(),
+            },
+            shape: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn swf_shapes_are_lazy_and_idle_handles_are_evictable() {
+        let shared =
+            GraphicShared::from_swf_shape(test_shape(), Arc::new(SwfMovie::empty(32, None)));
+        assert!(shared.render_handle.borrow().is_none());
+
+        *shared.render_handle.borrow_mut() = Some(ShapeHandle(Arc::new(TestShapeHandle)));
+        let now = Instant::now();
+        shared.last_rendered.set(Some(now));
+        assert!(!shared.evict_shape_if_idle(now, Duration::from_secs(30)));
+
+        shared
+            .last_rendered
+            .set(Some(now - Duration::from_secs(31)));
+        assert!(shared.evict_shape_if_idle(now, Duration::from_secs(30)));
+        assert!(shared.render_handle.borrow().is_none());
+    }
 }
